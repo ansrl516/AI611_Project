@@ -28,12 +28,12 @@ os.environ["WANDB_CACHE_DIR"] = os.getcwd() + "/wandb/.cache/"
 os.environ["WANDB_CONFIG_DIR"] = os.getcwd() + "/wandb/.config/"
 
 
-def make_train_env(all_args, run_dir):
+def make_train_env(all_args, run_dir): # 경윤님 수정 예정
     def get_env_fn(rank):
         def init_env():
-            if all_args.env_name == "Overcooked": # currently, we only support overcooked for HMARl
-                if all_args.overcooked_version == "old":
-                    env = Overcooked(all_args, run_dir, rank=rank) # we use same env, hmarl policy and trainer has its own interface inside
+            if all_args.env_name == "Overcooked_new": # currently, we only support overcooked for HMARl
+                if all_args.overcooked_version == "new":
+                    env = Overcooked_new(all_args, run_dir, rank=rank) # we use same env, hmarl policy and trainer has its own interface inside
                 else:
                     env = Overcooked_new(all_args, run_dir, rank=rank) # but current problem is, they cannot be extended to ShareSubprocDummyBatchVecEnv or ShareDummyVecEnv 
             else:

@@ -41,7 +41,7 @@ class Ego_HMARLPolicy:
                     - Skill_estimate: Predicts current skill of partners using skill = pretrained_decoder(trajectory from last period)
                     - Skill_ego: Actual skill of current ego agent from last period.
                     - RNN_general_encoding: Encode trajectory of each agent using RNN
-                    - Partner_Behavior: Encode behavior of partner using (skill of partner|skills of others)
+                    - Partner_Behavior: Encode behavior of partner using (skill of partner|skills of others(ego + other partners))
                 Prediction of new skill:
                     - Use neural network that takes above info
                 Interal State Update:
@@ -66,6 +66,7 @@ class Ego_HMARLPolicy:
         - Critic Training Period is same as with Actor Training Period.
         """
 
+        # 문기가 API Spec 적어서 이현님 R_Actor, R_Critic 완성 (hmarl_zsc_actor_critic.py)
         self.actor = R_Actor(args, self.obs_space, self.num_skills, self.device) # FIXME: change R_Actor with our own Manager Actor: Should include 
         self.critic = R_Critic(args, self.share_obs_space, self.device) # FIXME: change R_Critic with our own Manager Critic
         self.pretrained_hsd = HMARLTrainer(args, obs_space, share_obs_space, act_space, device) # FIXME: fix parameter inputs for HMARLTrainer

@@ -159,7 +159,7 @@ class HMARLTrainer:
         self.decoder_training_threshold = config_h["N_batch_hsd"]
 
         # We will later remove env storage
-        self.env = base_env
+        self.env = base_env # instance of ZSC-Eval env  
 
         state_dim = self.env.state_dim
         num_actions = self.env.num_actions
@@ -172,7 +172,7 @@ class HMARLTrainer:
         self.buf_high = replay_buffer.Replay_Buffer(size=self.buffer_size)
         self.buf_low = replay_buffer.Replay_Buffer(size=self.buffer_size)
 
-        # Dataset of [obs traj, z] for training decoder
+        # Dataset of [obs traj, skill] for training decoder
         self.dataset = []
 
     def train(self):
@@ -208,7 +208,7 @@ class HMARLTrainer:
                         rewards_high = rewards_high * (self.config_alg['gamma']**self.steps_per_assign) # FIXME
                         self.buf_high.add([share_obs_high, policy_obs_high, skills_int, rewards_high, share_obs, policy_obs, done])
 
-                        # Compute intrinsic rewards for each agent based on decoder prediction
+                        # Compute intrinsic rewards for each agent based on decoder prediction <- low level policy에 들어가야 함 (FIXME)
                         for idx_agent in range(self.num_agents):
                             traj = np.array(traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape [obs_dim]
                             intrinsic_rewards[idx_agent] = self.hsd.compute_intrinsic_reward(
@@ -253,19 +253,19 @@ class HMARLTrainer:
                         for avail in available_actions
                     ])
                 else: # use low-level policy to select actions - tuples agent1 action, ... agentN action
-                    actions_int = self.hsd.get_actions(policy_obs, skills_int, self.epsilon)
+                    actions_int = self.hsd.get_actions(policy_obs, skills_int, self.epsilon) # shape: [num_agents,] - 0 ~ 5 per agent
                 
                 # Perform low-level step in environment (TODO: keep checking Overcooked_Env.py)
-                policy_obs_next, share_obs_next, policy_rewards, done, infos, available_actions = self.env.step(actions_int)
-                
-                # Update low-level buffer and then move to next state
-                self.buf_low.add([policy_obs, actions_int, rewards_low, skills_int, policy_obs_next, done])
-                policy_obs = policy_obs_next
-                share_obs = share_obs_next
+                policy_obs_next, share_obs_next, policy_rewards, done, infos, available_actions = self.env.step(actions_int) # shape: 경윤님 채워주세요! - info dictionary 안에 policy_obs_next, ...
 
                 # Compute low level rewards using intrisic_reward for each agent
                 rewards_low = policy_rewards
                 rewards_low = self.alpha * rewards_low + (1 - self.alpha) * intrinsic_rewards
+
+                # Update low-level buffer and then move to next state
+                self.buf_low.add([policy_obs, actions_int, rewards_low, skills_int, policy_obs_next, done])
+                policy_obs = policy_obs_next
+                share_obs = share_obs_next
 
                 # Store it into trajectory
                 for idx_agent in range(self.num_agents):
@@ -295,7 +295,7 @@ class HMARLTrainer:
             # If dataset has accumulated enough, train decoder
             if len(self.dataset) >= self.decoder_training_threshold:
                 expected_prob = self.hsd.train_decoder(self.dataset)
-                # If expected_prob is high, then increase number of skills
+                # If expected_prob is high, then increase number of skills (FIXME: Delete)
                 if expected_prob > self.curriculum_threshold:
                     self.N_skills_current = min(int(1.5 * self.N_skills_current + 1), self.N_skills)
                 # Clear dataset
