@@ -17,11 +17,9 @@ from loguru import logger
 
 from zsceval.config import get_config
 from zsceval.envs.env_wrappers import ShareDummyVecEnv, ShareSubprocDummyBatchVecEnv
-from zsceval.envs.overcooked.Overcooked_Env import Overcooked
 from zsceval.envs.overcooked_new.Overcooked_Env import Overcooked as Overcooked_new
 from zsceval.overcooked_config import get_overcooked_args
 from zsceval.utils.train_util import get_base_run_dir, setup_seed
-from zsceval.algorithms.hierarchical_marl_zsc.env_wrapper_Overcooked import OvercookedHMARLWrapper
 
 os.environ["WANDB_DIR"] = os.getcwd() + "/wandb/"
 os.environ["WANDB_CACHE_DIR"] = os.getcwd() + "/wandb/.cache/"
@@ -31,11 +29,8 @@ os.environ["WANDB_CONFIG_DIR"] = os.getcwd() + "/wandb/.config/"
 def make_train_env(all_args, run_dir): # 경윤님 수정 예정
     def get_env_fn(rank):
         def init_env():
-            if all_args.env_name == "Overcooked_new": # currently, we only support overcooked for HMARl
-                if all_args.overcooked_version == "new":
-                    env = Overcooked_new(all_args, run_dir, rank=rank) # we use same env, hmarl policy and trainer has its own interface inside
-                else:
-                    env = Overcooked_new(all_args, run_dir, rank=rank) # but current problem is, they cannot be extended to ShareSubprocDummyBatchVecEnv or ShareDummyVecEnv 
+            if all_args.env_name == "Overcooked_new": # currently, we only support overcooked_new for HMARL
+                env = Overcooked_new(all_args, run_dir, rank=rank) # we use overcooked_new env, hmarl policy and trainer has its own interface inside
             else:
                 print("Can not support the " + all_args.env_name + "environment.")
                 raise NotImplementedError
@@ -56,11 +51,8 @@ def make_train_env(all_args, run_dir): # 경윤님 수정 예정
 def make_eval_env(all_args, run_dir):
     def get_env_fn(rank):
         def init_env():
-            if all_args.env_name == "Overcooked":
-                if all_args.overcooked_version == "old":
-                    env = Overcooked(all_args, run_dir, rank=rank, evaluation=True)
-                else:
-                    env = Overcooked_new(all_args, run_dir, rank=rank, evaluation=True)
+            if all_args.env_name == "Overcooked_new": # currently, we only support overcooked_new for HMARL
+                env = Overcooked_new(all_args, run_dir, rank=rank, evaluation=True)
             else:
                 print("Can not support the " + all_args.env_name + "environment.")
                 raise NotImplementedError
@@ -130,10 +122,7 @@ def main(args):
     all_args.run_dir = run_dir
 
     # wandb
-    if all_args.overcooked_version == "new":
-        project_name = all_args.env_name + "-new"
-    else:
-        project_name = all_args.env_name
+    project_name = all_args.env_name + "-new"  # Always use overcooked_new
     if all_args.use_wandb:
         run = wandb.init(
             config=all_args,
