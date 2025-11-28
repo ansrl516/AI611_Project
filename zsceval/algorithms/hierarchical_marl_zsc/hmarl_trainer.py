@@ -1,15 +1,3 @@
-"""Lightweight wrapper around the hierarchical MARL (HSD) implementation.
-
-This module wires up three conveniences:
-- A small agent wrapper that exposes `assign_skills` and `act` for inference.
-- A thin training helper that runs `train_hsd.train_function` from the alg/ folder.
-- A saving routine that copies the trained checkpoint (decoder, low- and high-level
-  Q-networks) into a stable location under `hierarchical_marl/saved`.
-
-The actual algorithm code lives in `hierarchical_marl/alg`.  We simply make it easy
- to call into it from the rest of the project without touching sys.path elsewhere.
-"""
-
 from __future__ import annotations
 
 import json
@@ -29,85 +17,85 @@ import random
 from hmarl_policy import HMARLModel
 import utils.replay_buffer as replay_buffer
 
-ALG_DIR = Path(__file__).parent / "alg"
-RESULTS_DIR = ALG_DIR.parent / "results"
-DEFAULT_SAVE_DIR = Path(__file__).parent / "saved"
-DEFAULT_CONFIG = ALG_DIR / "config.json"
+# ALG_DIR = Path(__file__).parent / "alg"
+# RESULTS_DIR = ALG_DIR.parent / "results"
+# DEFAULT_SAVE_DIR = Path(__file__).parent / "saved"
+# DEFAULT_CONFIG = ALG_DIR / "config.json"
 
 
-def _ensure_alg_path() -> None:
-    """Make sure alg/ is importable."""
-    alg_path = str(ALG_DIR.resolve())
-    if alg_path not in sys.path:
-        sys.path.append(alg_path)
+# def _ensure_alg_path() -> None:
+#     """Make sure alg/ is importable."""
+#     alg_path = str(ALG_DIR.resolve())
+#     if alg_path not in sys.path:
+#         sys.path.append(alg_path)
 
 
-def _load_config(config_path: Optional[Path] = None) -> dict:
-    cfg_path = Path(config_path) if config_path else DEFAULT_CONFIG
-    with open(cfg_path, "r") as f:
-        return json.load(f)
+# def _load_config(config_path: Optional[Path] = None) -> dict:
+#     cfg_path = Path(config_path) if config_path else DEFAULT_CONFIG
+#     with open(cfg_path, "r") as f:
+#         return json.load(f)
 
 
-@dataclass(frozen=True)
-class EnvSpec:
-    """Minimal environment specification needed to construct HSD networks."""
+# @dataclass(frozen=True)
+# class EnvSpec:
+#     """Minimal environment specification needed to construct HSD networks."""
 
-    num_agents: int
-    state_dim: int
-    obs_dim: int
-    num_actions: int
+#     num_agents: int
+#     state_dim: int
+#     obs_dim: int
+#     num_actions: int
 
 
-class HMARLAgent:
-    """Inference-only wrapper around the HSD algorithm."""
+# class HMARLAgent:
+#     """Inference-only wrapper around the HSD algorithm."""
 
-    def __init__(self, alg, epsilon: float = 0.0):
-        self.alg = alg
-        self.epsilon = epsilon
+#     def __init__(self, alg, epsilon: float = 0.0):
+#         self.alg = alg
+#         self.epsilon = epsilon
 
-    @classmethod
-    def from_checkpoint(
-        cls,
-        checkpoint: Path,
-        env_spec: EnvSpec,
-        config_path: Optional[Path] = None,
-        device=None,
-    ) -> "HMARLAgent":
-        """Load a saved HSD checkpoint and return a ready-to-use agent."""
-        _ensure_alg_path()
-        import alg_hsd  # type: ignore
+#     @classmethod
+#     def from_checkpoint(
+#         cls,
+#         checkpoint: Path,
+#         env_spec: EnvSpec,
+#         config_path: Optional[Path] = None,
+#         device=None,
+#     ) -> "HMARLAgent":
+#         """Load a saved HSD checkpoint and return a ready-to-use agent."""
+#         _ensure_alg_path()
+#         import alg_hsd  # type: ignore
 
-        config = _load_config(config_path)
-        alg_cfg = config["alg"]
-        h_cfg = config["h_params"]
-        nn_cfg = config["nn_hsd"]
+#         config = _load_config(config_path)
+#         alg_cfg = config["alg"]
+#         h_cfg = config["h_params"]
+#         nn_cfg = config["nn_hsd"]
 
-        alg = alg_hsd.Alg(
-            alg_cfg,
-            h_cfg,
-            env_spec.num_agents,
-            env_spec.state_dim,
-            env_spec.obs_dim,
-            env_spec.num_actions,
-            h_cfg["N_skills"],
-            nn_cfg,
-            device=device,
-        )
-        alg.load(str(checkpoint))
-        return cls(alg)
+#         alg = alg_hsd.Alg(
+#             alg_cfg,
+#             h_cfg,
+#             env_spec.num_agents,
+#             env_spec.state_dim,
+#             env_spec.obs_dim,
+#             env_spec.num_actions,
+#             h_cfg["N_skills"],
+#             nn_cfg,
+#             device=device,
+#         )
+#         alg.load(str(checkpoint))
+#         return cls(alg)
 
-    def assign_skills(self, observations: Sequence, n_skills_current: Optional[int] = None, epsilon: Optional[float] = None):
-        """Choose a skill for each agent using the high-level policy."""
-        n_skills = n_skills_current or getattr(self.alg, "l_z", None)
-        if n_skills is None:
-            raise ValueError("Unable to infer number of skills; pass n_skills_current explicitly.")
-        eps = self.epsilon if epsilon is None else epsilon
-        return self.alg.assign_skills(observations, eps, n_skills)
+#     def assign_skills(self, observations: Sequence, n_skills_current: Optional[int] = None, epsilon: Optional[float] = None):
+#         """Choose a skill for each agent using the high-level policy."""
+#         n_skills = n_skills_current or getattr(self.alg, "l_z", None)
+#         if n_skills is None:
+#             raise ValueError("Unable to infer number of skills; pass n_skills_current explicitly.")
+#         eps = self.epsilon if epsilon is None else epsilon
+#         return self.alg.assign_skills(observations, eps, n_skills)
 
-    def act(self, observations: Sequence, skills_int, epsilon: Optional[float] = None):
-        """Select primitive actions for all agents given current skills."""
-        eps = self.epsilon if epsilon is None else epsilon
-        return self.alg.run_actor(observations, skills_int, eps)
+#     def act(self, observations: Sequence, skills_int, epsilon: Optional[float] = None):
+#         """Select primitive actions for all agents given current skills."""
+#         eps = self.epsilon if epsilon is None else epsilon
+#         return self.alg.run_actor(observations, skills_int, eps)
 
 
 # Trainer Class Compatible with ZSC-Eval
@@ -371,6 +359,14 @@ class HMARLTrainer:
         )
 
         return actions_int
+    
+    @torch.no_grad()
+    def reset(self):
+        """Reset internal skill storage."""
+        if hasattr(self, "_current_skills"):
+            del self._current_skills
+        if hasattr(self, "_current_skills_batch"):
+            del self._current_skills_batch
 
     @torch.no_grad()
     def act_in_pretrained_batch(self, steps, env_msg):
