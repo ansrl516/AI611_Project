@@ -1,0 +1,1 @@
+# Here, based on pretrained HMARL_Trainer, we provide ego policy and pretrained partner policy
