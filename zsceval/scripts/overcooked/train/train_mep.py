@@ -327,7 +327,7 @@ def main(args):
                 None,
             )  # only override share_obs_space
 
-    runner.policy.load_population(
+    runner.policy.load_population( # IMPT
         all_args.population_yaml_path,
         evaluation=False,
         override_policy_config=override_policy_config,

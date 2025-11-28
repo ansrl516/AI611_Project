@@ -1,0 +1,1 @@
+# Manager ego policy를 hmarl를 통해 훈련한 seed pool를 랜덤으로 가져와서 훈련 TODO (참고: train_mep.py)
