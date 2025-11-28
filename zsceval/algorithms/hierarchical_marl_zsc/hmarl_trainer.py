@@ -255,8 +255,21 @@ class HMARLTrainer:
                 else: # use low-level policy to select actions - tuples agent1 action, ... agentN action
                     actions_int = self.hsd.get_actions(policy_obs, skills_int, self.epsilon) # shape: [num_agents,] - 0 ~ 5 per agent
                 
-                # Perform low-level step in environment (TODO: keep checking Overcooked_Env.py)
-                policy_obs_next, share_obs_next, policy_rewards, done, infos, available_actions = self.env.step(actions_int) # shape: 경윤님 채워주세요! - info dictionary 안에 policy_obs_next, ...
+                # Perform low-level step in environment (overcooked_new)
+                policy_obs_next, share_obs_next, policy_rewards, done, infos, available_actions = self.env.step(actions_int)  # 경윤님....
+
+                # info 딕셔너리 key : 
+                # "all_agent_obs" : np.array of shape (num_agents, H, W, C)
+                # "share_obs" : np.array of shape (num_agents, H, W, C_share)
+                # "available_actions" : np.array of shape (num_agents, num_actions)
+                # "bad_transition" : bool - whether the transition is a bad transition
+                # "episode" : dict - episode information
+
+                # "sparse_reward_by_agent" : list of float - sparse reward of the episode by agent
+                # "shaped_reward_by_agent" : list of float - shaped reward of the episode by agent
+                # "stuck": list of list of bool - whether the agent is stuck
+
+                ## all_agent_obs, share_obs, sparse_reward_by_agent, shaped_reward_by_agent -> 핵심 정보 
 
                 # Compute low level rewards using intrisic_reward for each agent
                 rewards_low = policy_rewards
