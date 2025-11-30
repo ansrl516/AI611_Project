@@ -216,7 +216,7 @@ class OvercookedRunner(Runner):
         self.buffer.available_actions[0] = available_actions.copy()
 
     @torch.no_grad()
-    def collect(self, step):
+    def collect(self, step): # corresponds to sampling actions from policy 
         self.trainer.prep_rollout()
         (
             value,

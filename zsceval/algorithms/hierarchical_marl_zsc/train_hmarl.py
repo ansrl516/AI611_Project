@@ -186,19 +186,19 @@ def main(args):
         "run_dir": run_dir,
     }
 
-    # run experiments with hmarl, we don't use runner here
-    from hmarl_trainer import HMARLTrainer
-    trainer = HMARLTrainer(config, envs)
-    trainer.train()
+    # run experiments with hmarl using our custom runner
+    from zsceval.runner.shared.overcooked_runner_hmarl import OvercookedRunnerHMARL as Runner
+    runner = Runner(config)
+    runner.run()
     envs.close()
 
     # post process
     if all_args.use_eval and eval_envs is not envs:
         eval_envs.close()
         run.finish(quiet=True)
-    # else:
-    #     runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
-    #     runner.writter.close() 
+    else:
+        runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
+        runner.writter.close() 
 
 
 if __name__ == "__main__":
