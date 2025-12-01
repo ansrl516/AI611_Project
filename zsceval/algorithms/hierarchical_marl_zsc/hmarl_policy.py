@@ -15,16 +15,16 @@ def hard_update(target, source):
 # HMARL for ZSC-Eval which includes update methods
 # Add encoder of observations (TODO) to match the shape
 class HMARLModel: 
-    def __init__(self, share_param, config_constants, config_traj_sampling, num_agents, 
-                 state_dim, obs_dim, num_actions, num_skills, config_nn, device=None):
+    def __init__(self, cfg_m, device=torch.device("cpu")):
         """Current Implmentation does not support environment batching
         Args:
-            share_param: parameter sharing option for decentralized training (for low-level policy, high-level policy)
-            config_constants: dictionary of {learning rate, update rate, discounting factor in RL}
-            config_traj_sampling: dictionary of trajectory downsampling options for decoder
-            num_agents: number of agents on the team controlled by this alg
-            state_dim, obs_dim, num_actions, num_skills: shared_obs dim, policy_obs dim, number of action, 
-            config_nn: dictionary with neural net sizes
+            rMAPPO-style structured config:
+
+            cfg["model"]
+            cfg["learning"]
+            cfg["traj_sampling"]
+            cfg["network"]
+            cfg["train"]
 
         Description of functions (functions not mentioned here are used only internally):
             Two levels of policies:
@@ -44,68 +44,91 @@ class HMARLModel:
             - Use compute_intrinsic_reward() to get decoder-based intrinsic rewards
 
         """
-        self.num_agents = num_agents
-        self.state_dim = state_dim
-        self.obs_dim = obs_dim
-        self.num_actions = num_actions # actions are one-hot encoded
+        
+        # Model settings
+        self.num_agents = cfg_m["num_agents"]
+        self.num_actions = cfg_m["num_actions"]
+        self.num_skills = cfg_m["num_skills"]
+        self.state_dim = cfg_m["state_dim"]
+        self.obs_dim = cfg_m["obs_dim"]
 
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
 
-        # Model configuration
-        self.nn = config_nn
-        self.num_skills = num_skills # dimension of the high skill variable (one-hot encoded)
-        self.tau = config_constants["tau"]
-        self.lr_Q = config_constants["lr_Q"]
-        self.lr_decoder = config_constants["lr_decoder"]
-        self.gamma = config_constants["gamma"]
+        # Observation shapes
+        self.C = cfg_m["obs_channels"]
+        self.H = cfg_m["obs_height"]
+        self.W = cfg_m["obs_width"]
+        self.C_share = cfg_m["share_obs_channels"]
 
-        # Model for encoding obs 
-        # "all_agent_obs" : np.array of shape (num_agents, H, W, C) -> (num_agents, obs_dim)
-        # "share_obs" : np.array of shape (num_agents, H, W, C_share) -> (num_agents, state_dim)
+        # Learning params
+        self.gamma = cfg_m["gamma"]
+        self.tau = cfg_m["tau"]
+        self.lr_Q = cfg_m["lr_q"]
+        self.lr_decoder = cfg_m["lr_decoder"]
+
+        # Trajectory sampling
+        self.steps_per_assign = cfg_m["steps_per_assign"]
+        self.traj_skip = cfg_m["traj_skip"]
+        self.use_state_difference = cfg_m["use_state_difference"]
+        self.obs_truncate_length = cfg_m["obs_truncate_length"]
+
+        # Network sizes
+        self.nn = {
+            "n_h_decoder": cfg_m["n_h_decoder"],
+            "n_h1_low": cfg_m["n_h1_low"],
+            "n_h2_low": cfg_m["n_h2_low"],
+            "n_h1": cfg_m["n_h1_high"],
+            "n_h2": cfg_m["n_h2_high"],
+            "n_h_mixer": cfg_m["n_h_mixer"],
+        }
+
+        # ----------------------------------------------------------------------
+        # Build networks
+        # ----------------------------------------------------------------------
         self.obs_encoder = networks.ObsEncoder(self.C, self.obs_dim, self.H, self.W).to(self.device)
         self.share_obs_encoder = networks.ShareObsEncoder(self.C_share, self.state_dim, self.H, self.W).to(self.device)
 
-        # Decoder settings
-        self.traj_length = config_traj_sampling["steps_per_assign"]
-        self.traj_skip = config_traj_sampling["traj_skip"]
-        self.traj_length_downsampled = int(np.ceil(self.traj_length / self.traj_skip))
-        self.use_state_difference = config_traj_sampling["use_state_difference"]
-        if self.use_state_difference:
-            self.traj_length_downsampled -= 1
-        self.obs_truncate_length = config_traj_sampling["obs_truncate_length"]
-        assert (self.obs_truncate_length is None) or (self.obs_truncate_length <= self.obs_dim)
-
-        # Decoder Network
+        # Decoder
+        self.traj_length_downsampled = int(np.ceil(self.steps_per_assign / self.traj_skip))
         decoder_input_dim = self.obs_truncate_length or self.obs_dim
-        self.decoder = networks.Decoder(decoder_input_dim, self.traj_length_downsampled, self.nn["n_h_decoder"], self.num_skills).to(self.device)
-        
-        # Decoder Optimizer and Loss
-        self.decoder_opt = optim.Adam(self.decoder.parameters(), lr=self.lr_decoder)
+        self.decoder = networks.Decoder(
+            decoder_input_dim,
+            self.traj_length_downsampled,
+            self.nn["n_h_decoder"],
+            self.num_skills
+        ).to(self.device)
+
+        self.decoder_opt = torch.optim.Adam(self.decoder.parameters(), lr=self.lr_decoder)
         self.ce_loss = nn.CrossEntropyLoss()
 
-        # Currently, only parameter sharing option supported is "all_shared"
-        assert share_param == "all_shared", "Only 'all_shared' parameter sharing option is supported currently."
+        # Low-level Q-functions
+        self.Q_low = networks.QLow(self.obs_dim, self.num_skills,
+                                   self.nn["n_h1_low"], self.nn["n_h2_low"], self.num_actions).to(self.device)
+        self.Q_low_target = networks.QLow(self.obs_dim, self.num_skills,
+                                          self.nn["n_h1_low"], self.nn["n_h2_low"], self.num_actions).to(self.device)
+        hard_update(self.Q_low_target, self.Q_low)
+        self.low_opt = torch.optim.Adam(self.Q_low.parameters(), lr=self.lr_Q)
 
-        # Low-level Q-functions (target stands for moving average update)
-        self.Q_low = networks.QLow(self.obs_dim, self.num_skills, self.nn["n_h1_low"], self.nn["n_h2_low"], self.num_actions).to(self.device)
-        self.Q_low_target = networks.QLow(self.obs_dim, self.num_skills, self.nn["n_h1_low"], self.nn["n_h2_low"], self.num_actions).to(self.device)
+        # High-level Qmix
+        self.agent_main = networks.QmixSingle(self.obs_dim,
+                                              self.nn["n_h1_high"], self.nn["n_h2_high"],
+                                              self.num_skills).to(self.device)
+        self.agent_target = networks.QmixSingle(self.obs_dim,
+                                                self.nn["n_h1_high"], self.nn["n_h2_high"],
+                                                self.num_skills).to(self.device)
 
-        # High-level Q-functions & Q-Centralized Mixer
-        self.agent_main = networks.QmixSingle(self.obs_dim, self.nn["n_h1"], self.nn["n_h2"], self.num_skills).to(self.device)
-        self.agent_target = networks.QmixSingle(self.obs_dim, self.nn["n_h1"], self.nn["n_h2"], self.num_skills).to(self.device)
         self.mixer_main = networks.QmixMixer(self.state_dim, self.num_agents, self.nn["n_h_mixer"]).to(self.device)
         self.mixer_target = networks.QmixMixer(self.state_dim, self.num_agents, self.nn["n_h_mixer"]).to(self.device)
-        
-        # Optimizer and Loss for Q-functions
-        hard_update(self.Q_low_target, self.Q_low)
-        self.low_opt = optim.Adam(self.Q_low.parameters(), lr=self.lr_Q)
-
         hard_update(self.agent_target, self.agent_main)
         hard_update(self.mixer_target, self.mixer_main)
-        self.high_opt = optim.Adam(list(self.agent_main.parameters()) + list(self.mixer_main.parameters()), lr=self.lr_Q)
+
+        self.high_opt = torch.optim.Adam(
+            list(self.agent_main.parameters()) + list(self.mixer_main.parameters()),
+            lr=self.lr_Q
+        )
         self.loss_fn = nn.MSELoss()
 
-        # Maintain internal storage of current skills
+        # Internal states
         self.current_skills = None
     
     ## --- API functions for using it as pretrained policy pool inside separated overcooked runner --- ##
@@ -181,21 +204,25 @@ class HMARLModel:
 
         return actions
 
-    def get_actions_low(self, list_obs, available_actions, skills):
+    def get_actions_low(self, obs, available_actions, skills):
         """Get low-level actions for all agents as a batch. Used in get_actions_algorithm. """
-        # Shape of list_obs: [n_rollouts, num_agents, H, W, C] where each entry stands for individual observation of that agent
+        # Shape of obs: [n_rollouts, num_agents, H, W, C] where each entry stands for individual observation of that agent
         # Shape of skills: [n_rollouts, num_agents,] where each entry is int skill of that agent
         # Shape of available_actions: [n_rollouts, num_agents, num_actions] where each entry is binary mask of available actions
         # Shape of actions: [n_rollouts, num_agents] where each entry is int action of that agent 
 
         # Transform into tensors & input form of obs_encoder, Q_low 
-        obs = torch.as_tensor(np.array(list_obs), dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents, obs_dim] (obs per agent)
-        skills_t = torch.as_tensor(np.array(skills), dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents] where each entry is int skill of that agent
+        obs_np = np.array(obs)
+        batch_size = obs_np.shape[0]
+
+        obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents, obs_dim] (obs per agent)
+        skills_np = np.array(skills)
+        skills_t = torch.as_tensor(skills_np, dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents] where each entry is int skill of that agent
         skills_t = torch.nn.functional.one_hot(skills_t.long(), num_classes=self.num_skills).float() # shape [n_rollouts, num_agents, num_skills]
         available_actions_t = torch.as_tensor(np.array(available_actions), dtype=torch.bool, device=self.device) # shape [n_rollouts, num_agents, num_actions]
 
-        # encoder list_obs: [n_rollouts, num_agents, H, W, C] -> [n_rollouts, num_agents, obs_dim]
-        list_obs = self.obs_encoder(list_obs, device=self.device)
+        # encoder obs: [n_rollouts, num_agents, H, W, C] -> [n_rollouts, num_agents, obs_dim]
+        obs = self.obs_encoder(obs, device=self.device)
 
         # get Q-values for each low level action given skill
         with torch.no_grad():
@@ -204,7 +231,7 @@ class HMARLModel:
             masked_q = q_values.masked_fill(~available_actions_t, float('-inf'))
             greedy_actions = torch.argmax(masked_q, dim=2).cpu().numpy() # select greedy low-level action per agent within available actions
 
-        actions = np.zeros((self.batch, self.num_agents), dtype=int)
+        actions = np.zeros((batch_size, self.num_agents), dtype=int)
         for idx in range(self.num_agents):
             actions[:, idx] = greedy_actions[:, idx]
         return actions
@@ -215,7 +242,9 @@ class HMARLModel:
         # skills: [n_rollouts, num_agents,] where each entry is int skill of that agent
 
         # Transform into tensors & input form of share_obs_encoder
-        share_obs = torch.as_tensor(np.array(share_obs), dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents, obs_dim] (obs per agent)
+        share_obs_np = np.array(share_obs)
+        batch_size = share_obs_np.shape[0]
+        share_obs = torch.as_tensor(share_obs_np, dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents, obs_dim] (obs per agent)
         
         # API requirement of share_obs_encoder: share_obs: [B, N, H, W, C_share] -> [B, N, state_dim]
         share_obs = self.share_obs_encoder(share_obs, device=self.device)
@@ -225,8 +254,8 @@ class HMARLModel:
             skills_argmax = torch.argmax(q_values, dim=2).cpu().numpy() # select greedy skill per agent
 
         # ε-greedy exploration
-        skills = np.zeros((self.batch, self.num_agents), dtype=int)
-        for b in range(self.batch):
+        skills = np.zeros((batch_size, self.num_agents), dtype=int)
+        for b in range(batch_size):
             for i in range(self.num_agents):
                 if np.random.rand() < epsilon:
                     skills[b, i] = np.random.randint(0, self.num_skills)
@@ -249,10 +278,10 @@ class HMARLModel:
         # shape of next_share_obs: [batch, num_agents, H, W, C_share]
         # shape of done: [batch,] (episode termination flag 1 0)
 
-        assert batch.shape[1] == 8, "Batch shape incorrect for high-level policy training."
+        assert batch.shape[1] == 7, "Batch shape incorrect for high-level policy training."
 
         # merge n_steps and batch dimensions
-        batch = np.asarray(batch) # shape [n_steps, batch, 8] where each i in [8] holds python obj
+        batch = np.asarray(batch) # shape [n_steps, batch, 7] where each i in [7] holds python obj
         batch = batch.reshape(-1, batch.shape[2]) # shape [n_steps * batch, ...]
 
         # organize batch data
@@ -291,13 +320,14 @@ class HMARLModel:
         n_steps, state, obs, skills_1hot, reward, state_next, obs_next, done = self.process_batch_high(batch)
 
         with torch.no_grad(): # one step TD
-            argmax_actions = torch.argmax(self.agent_target(obs_next), dim=1)
+            argmax_actions = torch.argmax(self.agent_target(obs_next), dim=2)  # shape: [B_total, num_agents]
+            # One-hot target skills per agent, matching agent_target output shape [B_total, num_agents, num_skills]
             skills_target_1hot = torch.zeros(
-                (n_steps * self.num_agents, self.num_skills), dtype=torch.float32, device=self.device
+                (argmax_actions.shape[0], self.num_agents, self.num_skills), dtype=torch.float32, device=self.device
             )
-            skills_target_1hot.scatter_(1, argmax_actions.unsqueeze(1), 1.0)
+            skills_target_1hot.scatter_(2, argmax_actions.unsqueeze(-1), 1.0)
 
-            q_target_selected = (self.agent_target(obs_next) * skills_target_1hot).sum(dim=1)
+            q_target_selected = (self.agent_target(obs_next) * skills_target_1hot).sum(dim=2)
             mixer_input_target = q_target_selected.view(-1, self.num_agents)
 
             state_next_t = torch.as_tensor(state_next, dtype=torch.float32, device=self.device)
@@ -310,7 +340,7 @@ class HMARLModel:
         skills_1hot_t = torch.as_tensor(skills_1hot, dtype=torch.float32, device=self.device)
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device)
 
-        q_selected = (self.agent_main(obs_t) * skills_1hot_t).sum(dim=1)
+        q_selected = (self.agent_main(obs_t) * skills_1hot_t).sum(dim=2)
         mixer_input = q_selected.view(-1, self.num_agents)
         q_tot = self.mixer_main(mixer_input, state_t).squeeze(1)
 
@@ -376,8 +406,8 @@ class HMARLModel:
             q_target = self.Q_low_target(obs_next, skills)
             done_multiplier = -(torch.as_tensor(done, dtype=torch.float32, device=self.device) - 1.0) # if done, future value contribution is zero
             target = torch.as_tensor(rewards, dtype=torch.float32, device=self.device) \
-                     + self.gamma * torch.max(q_target, dim=1)[0] * done_multiplier
-        q_selected = (self.Q_low(obs, skills) * actions_1hot).sum(dim=1)
+                     + self.gamma * torch.max(q_target, dim=2)[0] * done_multiplier
+        q_selected = (self.Q_low(obs, skills) * actions_1hot).sum(dim=2)
     
         loss = self.loss_fn(q_selected, target)
         self.low_opt.zero_grad()
@@ -443,13 +473,15 @@ class HMARLModel:
         with torch.no_grad():
             # API requirement of decoder: [B, traj_length_downsampled, obs_dim] -> probs: [B, N_skills]
             _, decoder_probs = self.decoder(traj_t)
-            prob = torch.sum(decoder_probs * torch.as_tensor(skills, dtype=torch.float32, device=self.device), dim=1)
+            skills_onehot = torch.nn.functional.one_hot(torch.as_tensor(skills, dtype=torch.long, device=self.device),num_classes=self.num_skills,).float()
+            prob = torch.sum(decoder_probs * skills_onehot, dim=1)
         return prob.cpu().numpy()
     
     @torch.no_grad()
     def reset(self):
-        """Reset internal skill storage."""
+        """Reset internal skill storage """
         self.current_skills = None
+
 
 
     def save(self, path):

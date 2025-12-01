@@ -1,21 +1,13 @@
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Sequence
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
 
-from hmarl_policy import HMARLModel
-import utils.replay_buffer as replay_buffer
+from zsceval.algorithms.hierarchical_marl_zsc.hmarl_policy import HMARLModel
+from zsceval.algorithms.hierarchical_marl_zsc.utils.replay_buffer import Replay_Buffer
 
 # Trainer Class Compatible with ZSC-Eval
 # In training, it is wrapped with simplest runner which not compatible with base_runner
@@ -24,86 +16,77 @@ import utils.replay_buffer as replay_buffer
 class HMARLTrainer:
     """Wrapper to bridge ZSC env messaging with HMARL policy/trainer."""
 
-    def __init__(self, config):
-        # Setup configs
-        config_param_sharing_option = config["param_sharing_option"] # decide parameter sharing for Q_low and Q_high
-        config_main = config["main"]
-        config_alg = config["alg"] # parameter related to general training settings
-        config_h = config["h_params"] # important parameter
+    def __init__(self, config, device=torch.device("cpu")):
 
-        seed = config_main["seed"]
+        # Extract structured configs
+        cfg_tr = config["trainer"]
+        cfg_m = config["model"]
+
+        # Seeding
+        seed = cfg_tr["seed"]
         np.random.seed(seed)
         random.seed(seed)
         torch.manual_seed(seed)
 
-        dir_name = config_main["dir_name"]
+        # Load trainer params
+        self.N_train = cfg_tr["N_train"]
+        self.N_eval = cfg_tr["N_eval"]
+        self.period = cfg_tr["period"]
+        self.buffer_size = cfg_tr["buffer_size"]
+        self.batch_size = cfg_tr["batch_size"]
+        self.pretrain_episodes = cfg_tr["pretrain_episodes"]
+        self.steps_per_train = cfg_tr["steps_per_train"]
 
-        os.makedirs("../results/%s" % dir_name, exist_ok=True)
-        with open("../results/%s/%s" % (dir_name, "config.json"), "w") as f:
-            json.dump(config, f, indent=4)
-
-        # config for training settings
-        self.N_train = config_alg["N_train"]
-        self.N_eval = config_alg["N_eval"]
-        self.period = config_alg["period"]
-        self.buffer_size = config_alg["buffer_size"]
-        self.batch_size = config_alg["batch_size"]
-        self.pretrain_episodes = config_alg["pretrain_episodes"]
-        self.steps_per_train = config_alg["steps_per_train"]
-
-        # config for exploration
-        self.epsilon_start = config_alg["epsilon_start"]
-        self.epsilon_end = config_alg["epsilon_end"]
-        self.epsilon_div = config_alg["epsilon_div"]
-        self.epsilon_step = (self.epsilon_start - self.epsilon_end) / float(self.epsilon_div)
+        # Exploration params
+        self.epsilon_start = cfg_tr["epsilon_start"]
+        self.epsilon_end = cfg_tr["epsilon_end"]
+        self.epsilon_div = cfg_tr["epsilon_div"]
         self.epsilon = self.epsilon_start
+        self.epsilon_step = (self.epsilon_start - self.epsilon_end) / float(self.epsilon_div)
 
-        # config for skills
-        self.N_skills = config_h["N_skills"] # Final number of skills
-        self.steps_per_assign = config_h["steps_per_assign"] # Number of steps per skill assignment
-        
-        # config for reward coefficient
-        self.alpha = config_h["alpha_start"]
-        self.alpha_end = config_h["alpha_end"]
-        self.alpha_step = config_h["alpha_step"]
-        self.alpha_threshold = config_h["alpha_threshold"]
+        # Reward mixing parameters
+        self.alpha = cfg_tr["alpha_start"]
+        self.alpha_end = cfg_tr["alpha_end"]
+        self.alpha_step = cfg_tr["alpha_step"]
+        self.alpha_threshold = cfg_tr["alpha_threshold"]
 
-        # config for Number of single-agent trajectory segments used for each decoder training step
-        self.decoder_training_threshold = config_h["N_batch_hsd"]
+        # Skills
+        self.N_skills = cfg_tr["N_skills"]
+        self.steps_per_assign = cfg_tr["steps_per_assign"]
+        self.decoder_training_threshold = cfg_tr["decoder_training_threshold"]
 
-        state_dim = self.state_dim = config_h["state_dim"] # shared_obs for centralized critic
-        num_actions = self.num_actions = config_h["num_actions"] # type of actions
-        obs_dim = self.obs_dim = config_h["obs_dim"] # for policy input (Q_low, Q_high, decoder)
-        num_agents = self.num_agents = config_h["num_agents"]  # number of agents
+        # Load model parameters (cleaned and grouped)
+        state_dim = cfg_m["state_dim"]
+        num_actions = cfg_m["num_actions"]
+        obs_dim = cfg_m["obs_dim"]
+        self.num_agents = cfg_m["num_agents"]
+        self.num_actions = cfg_m["num_actions"]
 
-        # Import Policy and Trainer
-        self.hsd = HMARLModel(config_param_sharing_option, config_main, config_h, num_agents, state_dim, obs_dim, num_actions, self.N_skills, config["nn_hsd"])
-        
-        ## From here, setup internal buffers and counters for training ##
-        # To reuse some of the trajectories for updating Qs, we maintain high & low level replay buffers (regardless of agent & batch):
-        self.buf_high = replay_buffer.Replay_Buffer(size=self.buffer_size)
-        self.buf_low = replay_buffer.Replay_Buffer(size=self.buffer_size)
+        # ---- Build HMARL Policy (unchanged logic) ----
+        self.hsd = HMARLModel(cfg_m, device=device)
 
-        # Other internal variables
-        self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int) if self.batch_size > 0 else np.zeros(self.num_agents, dtype=int) # current skill assignment for each agent in the batch
-        self.obs_h = None # high level observation at the time of skill assignment
-        self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents) # intrinsic rewards for each agent in the batch
+        # ---- Replay buffers ----
+        self.buf_high = Replay_Buffer(size=self.buffer_size)
+        self.buf_low = Replay_Buffer(size=self.buffer_size)
 
-        # Dataset of [obs traj, skill] for training decoder (regardless of agent and batch)
-        self.dataset = []
-
-        # Datastructure for internally storing trajectories of each agent during previous period
-        # stores trajectory of each agent up to steps_per_assign
+        # ---- Internal variables ----
+        # Note: batch_size from config is only a default; we re-sync shapes at runtime when inputs carry a different leading batch.
         if self.batch_size == 0:
-            self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
+            self.current_skills = np.zeros(self.num_agents, dtype=int)
+            self.intrinsic_rewards = np.zeros(self.num_agents)
+            self.traj_per_agent = [[] for _ in range(self.num_agents)]
         else:
+            self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int)
+            self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
             self.traj_per_agent = [
-                [[] for _ in range(self.batch_size)]
-                for _ in range(self.num_agents)
+                [[] for _ in range(self.num_agents)]
+                for _ in range(self.batch_size)
             ]
 
-        # Datastructure for High level reward
-        self.rewards_high = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
+        self.dataset = []
+        self.obs_h = None
+        self.share_obs_h = None
+        self.rewards_high = np.zeros_like(self.current_skills)
 
     # --- Core functions that is run only in shared overcookedhmarl runner (overcooked_runner_hmarl.py) --- #
 
@@ -136,19 +119,41 @@ class HMARLTrainer:
         if episode_step >= self.pretrain_episodes and self.epsilon > self.epsilon_end:
             self.epsilon -= self.epsilon_step
 
-        # Decide which information to log (TODO)
-        train_infos = {}
-
         # Additionally, update exploration rate epsilon and reward coefficient alpha
         if self.alpha < self.alpha_threshold:
             self.alpha += self.alpha_step
             if self.alpha > self.alpha_threshold:
                 self.alpha = self.alpha_threshold
-        if episode_step >= self.pretrain_episodes and self.epsilon > self.epsilon_end:
-            self.epsilon -= self.epsilon_step
 
+        ## Decide what information to log ##
+        train_infos = {}
+
+        # Exploration parameters
+        train_infos["epsilon"] = self.epsilon
+        train_infos["alpha"] = self.alpha
+
+        # Decoder expected probability (if decoder was trained this step)
+        if 'expected_prob' in locals():
+            train_infos["decoder_expected_prob"] = float(expected_prob)
+
+        # Skill usage statistics (histogram)
+        if self.batch_size > 0:
+            flat_skills = self.current_skills.flatten()
+        else:
+            flat_skills = self.current_skills
+        skill_counts = np.bincount(flat_skills, minlength=self.N_skills)
+        train_infos["skill_usage"] = (skill_counts / skill_counts.sum()).tolist()
+
+        # Intrinsic reward diagnostics
+        if hasattr(self, "intrinsic_rewards"):
+            train_infos["intrinsic_reward_mean"] = float(np.mean(self.intrinsic_rewards))
+
+        # High-level reward diagnostics
+        if hasattr(self, "rewards_high"):
+            train_infos["high_level_reward_mean"] = float(np.mean(self.rewards_high))
+        ## end of log filling ##
         return train_infos
-    
+
     # Update buffer and accumulated high level rewards based on environment step
     @torch.no_grad()
     def update_buffer(self, steps, obs, share_obs, actions, rewards, next_obs, next_share_obs, dones):
@@ -166,34 +171,38 @@ class HMARLTrainer:
 
             ## all_agent_obs, share_obs, sparse_reward_by_agent, shaped_reward_by_agent -> 핵심 정보 
         
+        # Infer effective batch size from obs shape (if no rollout dim, treat as single env with batch_size=0).
+        obs_np = np.array(obs)
+        incoming_batch = obs_np.shape[0] if obs_np.ndim > 4 else 0
+        if incoming_batch != self.batch_size:
+            self.reset_internals(incoming_batch)
+
         # Update low-level buffer with intrinsic reward and store it into buffer
-        if self.batch_size > 0:
-            intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
-        intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
+        self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
 
         if self.batch_size > 0:
             for batch_idx in range(self.batch_size):
                 for idx_agent in range(self.num_agents):
-                    traj = np.array(self.traj_per_agent[idx_agent][batch_idx][-self.steps_per_assign:])  # shape [obs_dim]
-                    intrinsic_rewards[batch_idx][idx_agent] = self.hsd.compute_intrinsic_reward(
+                    traj = np.array(self.traj_per_agent[batch_idx][idx_agent][-self.steps_per_assign:])  # shape [obs_dim]
+                    self.intrinsic_rewards[batch_idx][idx_agent] = self.hsd.compute_intrinsic_reward(
                         traj, self.current_skills[batch_idx][idx_agent]
                     )
         else:
             for idx_agent in range(self.num_agents):
                 traj = np.array(self.traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape [obs_dim]
-                intrinsic_rewards[idx_agent] = self.hsd.compute_intrinsic_reward(
+                self.intrinsic_rewards[idx_agent] = self.hsd.compute_intrinsic_reward(
                     traj, self.current_skills[idx_agent]
                 )
 
-        rewards_low = self.alpha * rewards + (1 - self.alpha) * intrinsic_rewards
+        rewards_low = self.alpha * rewards + (1 - self.alpha) * self.intrinsic_rewards
 
         self.buf_low.add([obs, actions, rewards_low, self.current_skills, next_obs, dones])
         
         # Update accumulated rewards for high level policy
-        self.rewards_high += rewards * (self.config_alg['gamma']**self.steps_per_assign)
+        self.rewards_high += rewards * (self.hsd.gamma**self.steps_per_assign)
 
         # Update high-level buffer and then reset accumulated high level rewards at the end of this skill assignment period
-        if steps % self.steps_per_assign == -1 and steps != 0:
+        if (steps+1) % self.steps_per_assign == 0 and steps != 0:
             self.buf_high.add([self.obs_h, self.share_obs_h, self.current_skills, self.rewards_high, next_obs, next_share_obs, dones])
             
             # Reset accumulated high level rewards
@@ -204,8 +213,8 @@ class HMARLTrainer:
                 self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
             else:
                 self.traj_per_agent = [
-                    [[] for _ in range(self.batch_size)]
-                    for _ in range(self.num_agents)
+                    [[] for _ in range(self.num_agents)]
+                    for _ in range(self.batch_size)
                 ]
 
             # Append skill-trajectory to dataset for training decoder (regardless of agent and batch)
@@ -225,12 +234,11 @@ class HMARLTrainer:
         # Update trajectory per agent data structure
         if self.batch_size == 0:
             for idx_agent in range(self.num_agents):
-                self.traj_per_agent[idx_agent].append((obs[idx_agent], actions[idx_agent], rewards[idx_agent]))
+                self.traj_per_agent[idx_agent].append((obs[idx_agent]))
         else:
             for batch_idx in range(self.batch_size):
                 for idx_agent in range(self.num_agents):
-                    self.traj_per_agent[batch_idx][idx_agent].append((obs[batch_idx][idx_agent], actions[batch_idx][idx_agent], rewards[batch_idx][idx_agent]))
-
+                    self.traj_per_agent[batch_idx][idx_agent].append((obs[batch_idx][idx_agent]))
     # Fetch low level actions during training mode, 
     # manages internal buffers, skill assignments, intrinsic rewards, high level rewards ... 
     @torch.no_grad()
@@ -251,13 +259,29 @@ class HMARLTrainer:
 
         self.prep_rollout() # set eval mode for policy
 
+        # Infer batch size from leading dimension; if absent, treat as unbatched (batch_size=0) and add a dummy batch dim for policy call.
+        obs_np = np.array(obs)
+        incoming_batch = obs_np.shape[0] if obs_np.ndim > 4 else 0
+        if incoming_batch != self.batch_size:
+            self.reset_internals(incoming_batch)
+
+        if self.batch_size == 0:
+            obs_in = obs_np[np.newaxis, ...]
+            share_obs_in = np.array(share_obs)[np.newaxis, ...]
+            avail_in = np.array(available_actions)[np.newaxis, ...]
+        else:
+            obs_in = obs_np
+            share_obs_in = np.array(share_obs)
+            avail_in = np.array(available_actions)
+
         # Trainer internally includes policy, and updates buffers, current skills, intrinsic rewards, ... internally
         # so it only prints out actions, actual training algorithm of hmarl is hidden
         # skills_int is the newly assigned skills at this step (or is just the same skill within period)
-        actions, skills_int = self.hsd.get_actions_algorithm(steps, obs, share_obs, available_actions, self.epsilon)
+        actions = self.hsd.get_actions_algorithm(steps, obs_in, share_obs_in, avail_in, self.epsilon)
+        skills_int = self.hsd.current_skills
 
         # At time of new skill assignment, update new skill and store it to current_skills
-        if steps % self.steps_per_assign == 0 and steps != 0:
+        if steps % self.steps_per_assign == 0:
 
             # Update new skills (balance between exploration and exploitation)
             if steps < self.pretrain_episodes: # random skill assignment during warmup
@@ -289,11 +313,12 @@ class HMARLTrainer:
                         else:
                             actions[b, agent] = np.random.randint(self.num_actions)
 
-        return actions # shape: [batch_size, num_agents] or [num_agents,] depending on batch_size with value 0 ~ num_actions-1
+        return actions[0] if self.batch_size == 0 else actions # shape: [batch_size, num_agents] or [num_agents,] depending on batch_size with value 0 ~ num_actions-1
 
-    # Reset internal variables at the before episode starts again
+    # Reset internal variables and storage at the before episode starts again
     @torch.no_grad()
-    def reset_internals(self):
+    def reset_internals(self, batch_size):
+        self.batch_size = batch_size
         self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int) if self.batch_size > 0 else np.zeros(self.num_agents, dtype=int)
         self.obs_h = None
         self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
@@ -320,4 +345,5 @@ class HMARLTrainer:
     def save(self, step, save_path: str) -> None:
         """Save HMARL policy to the given path."""
         os.makedirs(save_path, exist_ok=True)
-        self.hsd.save(step, save_path)
+        model_path = os.path.join(save_path, f"model_{step}.pt")
+        self.hsd.save(model_path)

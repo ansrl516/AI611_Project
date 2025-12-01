@@ -80,6 +80,12 @@ def parse_args(args, parser: argparse.ArgumentParser):
     )
 
     parser.add_argument("--use_task_v_out", default=False, action="store_true")
+    parser.add_argument(
+        "--hmarl_trainer_config_path",
+        type=str,
+        default="zsceval/algorithms/hierarchical_marl_zsc/config/hmarl_trainer_config.pkl",
+        help="Path to HMARL trainer config pickle.",
+    )
     # all_args = parser.parse_known_args(args)[0]
     all_args = parser.parse_args(args)
     from zsceval.overcooked_config import OLD_LAYOUTS
@@ -195,10 +201,12 @@ def main(args):
     # post process
     if all_args.use_eval and eval_envs is not envs:
         eval_envs.close()
-        run.finish(quiet=True)
+        if all_args.use_wandb:
+            run.finish(quiet=True)
     else:
-        runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
-        runner.writter.close() 
+        if not all_args.use_wandb and hasattr(runner, "writter"):
+            runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
+            runner.writter.close() 
 
 
 if __name__ == "__main__":
