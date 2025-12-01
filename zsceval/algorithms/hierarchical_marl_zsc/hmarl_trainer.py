@@ -24,7 +24,7 @@ import utils.replay_buffer as replay_buffer
 class HMARLTrainer:
     """Wrapper to bridge ZSC env messaging with HMARL policy/trainer."""
 
-    def __init__(self, config, base_env):
+    def __init__(self, config):
         # Setup configs
         config_param_sharing_option = config["param_sharing_option"] # decide parameter sharing for Q_low and Q_high
         config_main = config["main"]
@@ -37,7 +37,6 @@ class HMARLTrainer:
         torch.manual_seed(seed)
 
         dir_name = config_main["dir_name"]
-        self.save_period = config_main["save_period"]
 
         os.makedirs("../results/%s" % dir_name, exist_ok=True)
         with open("../results/%s/%s" % (dir_name, "config.json"), "w") as f:
@@ -72,10 +71,10 @@ class HMARLTrainer:
         # config for Number of single-agent trajectory segments used for each decoder training step
         self.decoder_training_threshold = config_h["N_batch_hsd"]
 
-        state_dim = self.state_dim # shared_obs for centralized critic
-        num_actions = self.num_actions 
-        obs_dim = self.obs_dim # for policy input (Q_low, Q_high, decoder)
-        num_agents = self.num_agents  # number of agents
+        state_dim = self.state_dim = config_h["state_dim"] # shared_obs for centralized critic
+        num_actions = self.num_actions = config_h["num_actions"] # type of actions
+        obs_dim = self.obs_dim = config_h["obs_dim"] # for policy input (Q_low, Q_high, decoder)
+        num_agents = self.num_agents = config_h["num_agents"]  # number of agents
 
         # Import Policy and Trainer
         self.hsd = HMARLModel(config_param_sharing_option, config_main, config_h, num_agents, state_dim, obs_dim, num_actions, self.N_skills, config["nn_hsd"])
@@ -172,11 +171,19 @@ class HMARLTrainer:
             intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
         intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
 
-        for idx_agent in range(self.num_agents):
-            traj = np.array(self.traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape [obs_dim]
-            intrinsic_rewards[idx_agent] = self.hsd.compute_intrinsic_reward(
-                traj, self.current_skills[idx_agent]
-            )
+        if self.batch_size > 0:
+            for batch_idx in range(self.batch_size):
+                for idx_agent in range(self.num_agents):
+                    traj = np.array(self.traj_per_agent[idx_agent][batch_idx][-self.steps_per_assign:])  # shape [obs_dim]
+                    intrinsic_rewards[batch_idx][idx_agent] = self.hsd.compute_intrinsic_reward(
+                        traj, self.current_skills[batch_idx][idx_agent]
+                    )
+        else:
+            for idx_agent in range(self.num_agents):
+                traj = np.array(self.traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape [obs_dim]
+                intrinsic_rewards[idx_agent] = self.hsd.compute_intrinsic_reward(
+                    traj, self.current_skills[idx_agent]
+                )
 
         rewards_low = self.alpha * rewards + (1 - self.alpha) * intrinsic_rewards
 

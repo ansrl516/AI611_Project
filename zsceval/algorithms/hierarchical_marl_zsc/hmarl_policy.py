@@ -15,11 +15,11 @@ def hard_update(target, source):
 # HMARL for ZSC-Eval which includes update methods
 # Add encoder of observations (TODO) to match the shape
 class HMARLModel: 
-    def __init__(self, param_sharing_option, config_constants, config_traj_sampling, num_agents, 
+    def __init__(self, share_param, config_constants, config_traj_sampling, num_agents, 
                  state_dim, obs_dim, num_actions, num_skills, config_nn, device=None):
         """Current Implmentation does not support environment batching
         Args:
-            param_sharing_option: parameter sharing option for decentralized training (for low-level policy, high-level policy)
+            share_param: parameter sharing option for decentralized training (for low-level policy, high-level policy)
             config_constants: dictionary of {learning rate, update rate, discounting factor in RL}
             config_traj_sampling: dictionary of trajectory downsampling options for decoder
             num_agents: number of agents on the team controlled by this alg
@@ -84,7 +84,7 @@ class HMARLModel:
         self.ce_loss = nn.CrossEntropyLoss()
 
         # Currently, only parameter sharing option supported is "all_shared"
-        assert param_sharing_option == "all_shared", "Only 'all_shared' parameter sharing option is supported currently."
+        assert share_param == "all_shared", "Only 'all_shared' parameter sharing option is supported currently."
 
         # Low-level Q-functions (target stands for moving average update)
         self.Q_low = networks.QLow(self.obs_dim, self.num_skills, self.nn["n_h1_low"], self.nn["n_h2_low"], self.num_actions).to(self.device)
