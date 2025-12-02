@@ -89,7 +89,7 @@ class HMARLModel:
         self.share_obs_encoder = networks.ShareObsEncoder(self.C_share, self.state_dim, self.H, self.W).to(self.device)
 
         # Decoder
-        self.traj_length_downsampled = int(np.ceil(self.steps_per_assign / self.traj_skip))
+        self.traj_length_downsampled = int(np.floor(self.steps_per_assign / self.traj_skip))
         decoder_input_dim = self.obs_truncate_length or self.obs_dim
         self.decoder = networks.Decoder(
             decoder_input_dim,
@@ -438,11 +438,14 @@ class HMARLModel:
         networks.soft_update(self.Q_low_target, self.Q_low, self.tau)
 
     def _downsample_traj(self, obs): # helper function for decoder (shape of obs: [batch, traj_length, obs_dim])
+        print("obs shape in downsample", obs.shape)
         obs_downsampled = obs[:, :: self.traj_skip, :]
         if self.obs_truncate_length:
             obs_downsampled = obs_downsampled[:, :, : self.obs_truncate_length]
         if self.use_state_difference:
             obs_downsampled = obs_downsampled[:, 1:, :] - obs_downsampled[:, :-1, :]
+        print("obs_downsampled shape", obs_downsampled.shape)
+        print("self.traj_length_downsampled", self.traj_length_downsampled)
         assert obs_downsampled.shape[1] == self.traj_length_downsampled
         return obs_downsampled
 
@@ -461,9 +464,11 @@ class HMARLModel:
         skills = torch.as_tensor(np.array(skills), dtype=torch.long, device=self.device)
 
         # encode obs using encoder (change into shape [batch, traj_length, obs_dim])
+        print("obs shape before encoder", obs.shape)
         obs = self.obs_encoder(obs)
 
         # downsample trajectory
+        print("obs shape in train_decoder", obs.shape)
         obs_downsampled = self._downsample_traj(obs) # shape [batch, traj_length_downsampled, obs_dim]
 
         # train decoder
@@ -480,10 +485,17 @@ class HMARLModel:
 
         return expected_prob
 
+    # input(obs): [batch_size(=rollout_threads), num_agents, period of high policy, H, W, C] 
+    # output: [batch_size, num_agents, num_skills]
+    def use_decoder(obs): 
+        pass
+
     def compute_intrinsic_reward(self, agents_traj_obs, skills): # gives decoder classification loss which is used during training
-        # agents_traj_obs: np.array of shape (batch, traj_length, H, W, C)
+        # agents_traj_obs: np.array of shape (batch=rollout_threads*agents, traj_length, H, W, C)
         traj_np = np.array(agents_traj_obs)
         B, T = traj_np.shape[0], traj_np.shape[1]
+
+        print("traj_np shape in compute_intrinsic_reward", traj_np.shape)
 
         # Flatten time into batch for encoding, then restore [B, T, obs_dim]
         traj_flat = traj_np.reshape(B * T, *traj_np.shape[2:])  # (B*T, H, W, C)
@@ -493,6 +505,7 @@ class HMARLModel:
         agents_traj_obs = obs_encoded.reshape(B, T, -1)
 
         # downsample trajectory
+        print("agents_traj_obs shape in compute_intrinsic_reward", agents_traj_obs.shape)
         traj_t = self._downsample_traj(agents_traj_obs)
 
         with torch.no_grad():

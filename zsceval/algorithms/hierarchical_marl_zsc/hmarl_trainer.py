@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import deque
 
 import numpy as np
 import torch
@@ -74,17 +75,15 @@ class HMARLTrainer(OvercookedRunner):
 
         # ---- Internal variables ----
         # Note: batch_size from config is only a default; we re-sync shapes at runtime when inputs carry a different leading batch.
-        if self.batch_size == 0:
-            self.current_skills = np.zeros(self.num_agents, dtype=int)
-            self.intrinsic_rewards = np.zeros(self.num_agents)
-            self.traj_per_agent = [[] for _ in range(self.num_agents)]
-        else:
-            self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int)
-            self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
-            # env-major: [batch][agent] lists
-            self.traj_per_agent = [
-                [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
-            ]
+
+        self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int)
+        self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
+
+        # Per-agent trajectory sliding window: deque with maxlen = steps_per_assign
+        self.traj_per_agent = [
+            [deque(maxlen=self.steps_per_assign) for _ in range(self.num_agents)]
+            for _ in range(self.batch_size)
+        ]
 
         self.dataset = []
         self.obs_h = None
@@ -140,10 +139,8 @@ class HMARLTrainer(OvercookedRunner):
             train_infos["decoder_expected_prob"] = float(expected_prob)
 
         # Skill usage statistics (histogram)
-        if self.batch_size > 0:
-            flat_skills = self.current_skills.flatten()
-        else:
-            flat_skills = self.current_skills
+        flat_skills = self.current_skills.flatten()
+
         skill_counts = np.bincount(flat_skills, minlength=self.N_skills)
         train_infos["skill_usage"] = (skill_counts / skill_counts.sum()).tolist()
 
@@ -187,9 +184,9 @@ class HMARLTrainer(OvercookedRunner):
         rewards = rewards.squeeze(-1)  # shape: (batch_size, num_agents)
 
         # Update low-level buffer with intrinsic reward and store it into buffer
-        self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
+        self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
 
-        if self.batch_size > 0 and steps > self.steps_per_assign:
+        if steps > self.steps_per_assign:
             # Flatten agent and batch dims → compute intrinsic rewards in one shot
             traj_flat = np.array(
                 [
@@ -201,15 +198,9 @@ class HMARLTrainer(OvercookedRunner):
             skills_flat = self.current_skills.reshape(-1)  # batch-major flatten
             ir_flat = self.hsd.compute_intrinsic_reward(traj_flat, skills_flat)  # shape: (num_agents * batch_size,)
             self.intrinsic_rewards = ir_flat.reshape(self.batch_size, self.num_agents)  # back to (batch, agents)
-        elif self.batch_size > 0:
+        else:
             # Not enough history yet; keep intrinsic rewards at zero until trajectories accumulate.
             self.intrinsic_rewards[:] = 0.0
-        else:
-            for idx_agent in range(self.num_agents):
-                traj = np.array(self.traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape: (steps_per_assign, H, W, C) per agent
-                self.intrinsic_rewards[idx_agent] = self.hsd.compute_intrinsic_reward(
-                    traj, self.current_skills[idx_agent]
-                )
 
         print("rewards_shape:", rewards.shape)
         print("intrinsic_rewards_shape:", self.intrinsic_rewards.shape)
@@ -226,32 +217,21 @@ class HMARLTrainer(OvercookedRunner):
             
             # Append skill-trajectory to dataset for training decoder (regardless of agent and batch)
             # note if size of dataset exceeds threshold, clearing decoder is done in training_step
-            if self.batch_size == 0:
+            for batch_idx in range(self.batch_size):
                 for idx_agent in range(self.num_agents):
-                    self.dataset.append([self.traj_per_agent[idx_agent][-self.steps_per_assign:], self.current_skills[idx_agent]])
-            else:
-                for batch_idx in range(self.batch_size):
-                    for idx_agent in range(self.num_agents):
-                        self.dataset.append([self.traj_per_agent[batch_idx][idx_agent][-self.steps_per_assign:], self.current_skills[batch_idx][idx_agent]])
+                    self.dataset.append([self.traj_per_agent[batch_idx][idx_agent][-self.steps_per_assign:], self.current_skills[batch_idx][idx_agent]])
             # Reset accumulated high level rewards
             self.rewards_high = np.zeros_like(self.rewards_high)
 
             # Reset trajectory per agent data structure
-            if self.batch_size == 0:
-                self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
-            else:
-                self.traj_per_agent = [
-                    [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
-                ]
+            self.traj_per_agent = [
+                [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
+            ]
 
         # Update trajectory per agent data structure
-        if self.batch_size == 0:
+        for batch_idx in range(self.batch_size):
             for idx_agent in range(self.num_agents):
-                self.traj_per_agent[idx_agent].append((obs[idx_agent]))
-        else:
-            for batch_idx in range(self.batch_size):
-                for idx_agent in range(self.num_agents):
-                    self.traj_per_agent[batch_idx][idx_agent].append((obs[batch_idx][idx_agent]))
+                self.traj_per_agent[batch_idx][idx_agent].append((obs[batch_idx][idx_agent]))
     # Fetch low level actions during training mode, 
     # manages internal buffers, skill assignments, intrinsic rewards, high level rewards ... 
     @torch.no_grad()
@@ -306,24 +286,15 @@ class HMARLTrainer(OvercookedRunner):
         # Select random actions for each agent from available_actions   
         # Note available_actions is expected to be a mask array of shape (num_agents, num_actions) or (batch_size, num_agents, num_actions)
         if steps < self.pretrain_episodes:
-            if self.batch_size == 0:
-                actions = np.array([
-                    np.random.choice(np.where(avail == 1)[0])
-                    if np.any(avail)
-                    else np.random.randint(self.num_actions)
-                    for avail in available_actions
-                ])
-            
-            else:
-                actions = np.zeros((self.batch_size, self.num_agents), dtype=np.int32)
+            actions = np.zeros((self.batch_size, self.num_agents), dtype=np.int32)
 
-                for b in range(self.batch_size):
-                    for agent in range(self.num_agents):
-                        avail = available_actions[b, agent]   # shape (num_actions,)
-                        if np.any(avail):
-                            actions[b, agent] = np.random.choice(np.where(avail == 1)[0])
-                        else:
-                            actions[b, agent] = np.random.randint(self.num_actions)
+            for b in range(self.batch_size):
+                for agent in range(self.num_agents):
+                    avail = available_actions[b, agent]   # shape (num_actions,)
+                    if np.any(avail):
+                        actions[b, agent] = np.random.choice(np.where(avail == 1)[0])
+                    else:
+                        actions[b, agent] = np.random.randint(self.num_actions)
 
         return self._format_actions_for_env(actions)
 
@@ -334,13 +305,9 @@ class HMARLTrainer(OvercookedRunner):
         self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int)
         self.obs_h = None
         self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
-
-        if self.batch_size == 0:
-            self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
-        else:
-            self.traj_per_agent = [
-                [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
-            ]
+        self.traj_per_agent = [
+            [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
+        ]
 
         self.rewards_high = np.zeros_like(self.current_skills)
 
