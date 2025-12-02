@@ -125,7 +125,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         # Override trainer config
         # -----------------------
         # HMARLTrainer’s batch_size = number of parallel rollout envs
-        trainer_cfg["batch_size"] = self.all_args.n_rollout_threads
+        trainer_cfg["batch_size"] = self.all_args.n_rollout_threads * self.all_args.dummy_batch_size
         # Number of skills in trainer must match model
         trainer_cfg["N_skills"] = model_cfg["num_skills"]
         # Ensure steps_per_assign is mirrored
@@ -159,6 +159,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
     def run(self):
         # train sp
         obs, share_obs, available_actions = self.warmup() # changed from original warmup
+        print("obs shape:", obs.shape, "share_obs shape:", share_obs.shape, "available_actions shape:", available_actions.shape)
 
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
@@ -180,23 +181,17 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                     dones,
                     infos,
                     available_actions_next,
-                ) = self.envs.step(actions)
+                ) = self.envs.step(actions) # actions requirement: [n_rollout_threads, num_agents,]
 
                 # ===>>> Extract all_agent_obs from info_list <<<===
                 obs_next = np.array([info['all_agent_obs'] for info in infos])
                 total_num_steps += self.n_rollout_threads
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
 
-                self.trainer.update_buffer(
-                    step,
-                    obs,
-                    share_obs,
-                    actions,
-                    rewards,
-                    obs_next,
-                    share_obs_next,
-                    dones,
+                data = (
+                    step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones
                 )
+                self.insert(data)
 
                 obs, share_obs, rewards, available_actions = obs_next, share_obs_next, rewards, available_actions_next
 
@@ -336,17 +331,60 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         # 우리가 쓰는 버퍼는 오로지 Q함수 학습용이므로 warmup 함수를 변화시킨다.
         return all_agent_obs, share_obs, available_actions
 
+    # # merge rollout, batch into single batch dimension (also done in overcooked_runner)
+    # def transform(self, input):
+    #     shape = input.shape
+    #     return input.reshape(shape[0] * shape[1], *shape[2:])
+    # # separete batch dim into rollout, batch dims (rollout comes first)
+    # def inverse_transform(self, input, n_rollout_threads):
+    #     shape = input.shape
+    #     return input.reshape(n_rollout_threads, shape[0] // n_rollout_threads, *shape[1:])
+
     # from current step inside episode, collect actions and related variables for trainer
     # only used during training step
     @torch.no_grad()
     def collect(self, step, obs, share_obs, available_actions): # override to fit HMARLTrainer
         self.trainer.prep_rollout() # set eval mode for policy
 
+        # # merge rollout, batch into single batch dimension (also done in overcooked_runner)
+        # obs = self.transform(obs)
+        # share_obs = self.transform(share_obs)
+        # available_actions = self.transform(available_actions)
+
+        print("collect obs", obs.shape, "share_obs", share_obs.shape, "available_actions", available_actions.shape)
+
         # trainer internally includes policy, and updates buffers, current skills, intrinsic rewards, ... internally
         # so it only prints out actions, actual training algorithm of hmarl is hidden
         actions = self.trainer.get_actions_algorithm(step, obs, share_obs, available_actions)
 
+        # # separate batch dim into rollout, batch dims (rollout comes first)
+        # actions = self.inverse_transform(actions, self.n_rollout_threads)
+
         return actions
+
+    def insert(self, data): # override to fit HMARLTrainer
+        step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones = data
+
+        # retransform to (n_rollout_threads*batch_size, ...)
+        # obs = self.transform(obs)
+        # share_obs = self.transform(share_obs)
+        # actions = self.transform(actions)
+        rewards = self.transform(rewards)
+        obs_next = self.transform(obs_next)
+        share_obs_next = self.transform(share_obs_next)
+        dones = self.transform(dones)
+
+        self.trainer.update_buffer(
+            step,
+            obs,
+            share_obs,
+            actions,
+            rewards,
+            obs_next,
+            share_obs_next,
+            dones,
+        )
+
 
     def restore(self):
         # load config
@@ -429,7 +467,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 available_actions,
                 epsilon=0.0  # no exploration in eval
             )
-
+            # actions = self.inverse_transform(actions, self.n_eval_rollout_threads)
             # Step the environment
             (
                 _obs_single_agent,
@@ -438,7 +476,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 dones,
                 infos,
                 available_actions_next,
-            ) = self.eval_envs.step(actions)
+            ) = self.eval_envs.step(actions) # actions requirement: [n_eval_rollout_threads, num_agents,]
 
             # Extract next obs
             obs_next = np.array([info['all_agent_obs'] for info in infos])

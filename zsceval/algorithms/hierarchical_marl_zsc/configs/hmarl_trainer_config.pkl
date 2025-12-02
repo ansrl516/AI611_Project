@@ -57,7 +57,7 @@ config = {
         "n_h2_high": 128,
         "n_h_mixer": 64,
 
-        "batch_size": 1,
+        "batch_size": 1, # dummy
         "device": "cuda"
     }
 }

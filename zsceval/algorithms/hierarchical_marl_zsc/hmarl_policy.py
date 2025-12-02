@@ -130,6 +130,7 @@ class HMARLModel:
 
         # Internal states
         self.current_skills = None
+        self.step = 0
     
     ## --- API functions for using it as pretrained policy pool inside separated overcooked runner --- ##
     
@@ -139,49 +140,66 @@ class HMARLModel:
         # Dummies: rnn_states, rnn_states_critic, action_log_prob, masks
         """
         Inputs:
-            share_obs: (n_rollouts, obs_dim)
-            obs:       (n_rollouts, obs_dim)  ← used by actor
-            rnn_states: (n_rollouts, rnn_N, hidden)
-            rnn_states_critic: (n_rollouts, rnn_N, hidden)
-            masks:      (n_rollouts, 1)
-            available_actions: (n_rollouts, num_actions)
+            share_obs: (batch, num_agents, H, W, C_share)
+            obs:       (batch, num_agents, H, W, C)  ← used by actor
+            rnn_states: (batch, num_agents, rnn_N, hidden)  (unused placeholder)
+            rnn_states_critic: (batch, num_agents, rnn_N, hidden)  (unused placeholder)
+            masks:      (batch, 1)
+            available_actions: (batch, num_agents, num_actions)
         
         Outputs (all tensors):
-            value:              (n_rollouts, 1)
-            action:             (n_rollouts, act_dim)
-            action_log_prob:    (n_rollouts, act_dim) or (n_rollouts, 1)
-            next_rnn_state:     (n_rollouts, rnn_N, hidden)
-            next_rnn_state_cr:  (n_rollouts, rnn_N, hidden)
+            value:              (batch, num_agents, 1)  (dummy zeros)
+            action:             (batch, num_agents, 1)  (discrete index per agent)
+            action_log_prob:    (batch, num_agents, 1)  (dummy zeros)
+            next_rnn_state:     (batch, num_agents, rnn_N, hidden) (zeros)
+            next_rnn_state_cr:  (batch, num_agents, rnn_N, hidden) (zeros)
         """
 
-        n_rollouts = obs.shape[0]
+        batch_size = obs.shape[0]
         device = obs.device
 
         # ---- VALUE (dummy, fixed policy has no critic) ----
-        # MUST be shape (n_rollouts, 1)
-        value = torch.zeros((n_rollouts, 1), device=device)
+        # MUST be shape (batch, num_agents, 1)
+        value = torch.zeros((batch_size, self.num_agents, 1), device=device)
 
         # ---- ACTION ----
         # Fixed pretrained policy uses a feedforward actor
-        # actor(obs) must return shape: (n_rollouts, act_dim)
-        action = self.get_actions_algorithm(obs, available_actions, epsilon=0.0)    # Already correct shape
+        # actor(obs) must return shape: (batch_size, act_dim)
+        action = self.get_actions_algorithm(
+            steps=self.step,
+            obs=obs,
+            shared_obs=share_obs,
+            available_actions=available_actions,
+            epsilon=0.0,
+        )
 
         # ---- ACTION LOG PROB ----
         # A fixed deterministic policy can return zero logs
-        action_log_prob = torch.zeros((n_rollouts, 1), device=device)
+        action_log_prob = torch.zeros((batch_size, self.num_agents, 1), device=device)
 
         # ---- NEXT RNN STATES ----
         # Must match shape of input state
         next_rnn_state = torch.zeros_like(rnn_states)           # safe dummy
         next_rnn_state_critic = torch.zeros_like(rnn_states_critic)
 
+        # Increment internal step counter
+        self.step += 1
+
         return value, action, action_log_prob, next_rnn_state, next_rnn_state_critic
 
     # getting fixed actions for this policy (only used as fixed)
     def act(self, obs, rnn_state, mask, available_actions=None, deterministic=True):
         # Dummies: rnn_state, mask, deterministic
-        action = self.get_actions_algorithm(obs, available_actions, epsilon=0.0)
+        # share_obs is not used in low-level acting when deterministic
+        action = self.get_actions_algorithm(
+            steps=self.step,
+            obs=obs,
+            shared_obs=obs,
+            available_actions=available_actions,
+            epsilon=0.0,
+        )
         next_rnn_state = rnn_state
+        self.step += 1
         return action, next_rnn_state
 
     # dummy function for API compatibility
@@ -197,31 +215,31 @@ class HMARLModel:
         """ Wraps get_actions_low and assign_skills with internal variables, implements hmarl logic. """
         # 1. Assign skills at the beginning and every steps_per_assign
         if steps % self.steps_per_assign == 0:
-            self.current_skills = self.assign_skills(shared_obs, epsilon=epsilon)
+            self.current_skills = self.assign_skills(shared_obs, epsilon=epsilon) # shape: [batch_size, num_agents]
 
         # 2. Get low-level actions using current skills
-        actions = self.get_actions_low(obs, available_actions, self.current_skills)
+        actions = self.get_actions_low(obs, available_actions, self.current_skills) # shape: [batch_size, num_agents]
 
-        return actions
+        return self._format_actions(actions) # returns shape: [batch_size, num_agents, 1] (final 1 is dummy)
 
     def get_actions_low(self, obs, available_actions, skills):
         """Get low-level actions for all agents as a batch. Used in get_actions_algorithm. """
-        # Shape of obs: [n_rollouts, num_agents, H, W, C] where each entry stands for individual observation of that agent
-        # Shape of skills: [n_rollouts, num_agents,] where each entry is int skill of that agent
-        # Shape of available_actions: [n_rollouts, num_agents, num_actions] where each entry is binary mask of available actions
-        # Shape of actions: [n_rollouts, num_agents] where each entry is int action of that agent 
+        # Shape of obs: [batch_size, num_agents, H, W, C] where each entry stands for individual observation of that agent
+        # Shape of skills: [batch_size, num_agents,] where each entry is int skill of that agent
+        # Shape of available_actions: [batch_size, num_agents, num_actions] where each entry is binary mask of available actions
+        # Shape of actions: [batch_size, num_agents] where each entry is int action of that agent 
 
         # Transform into tensors & input form of obs_encoder, Q_low 
         obs_np = np.array(obs)
         batch_size = obs_np.shape[0]
 
-        obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents, obs_dim] (obs per agent)
+        obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device) # shape [batch_size, num_agents, obs_dim] (obs per agent)
         skills_np = np.array(skills)
-        skills_t = torch.as_tensor(skills_np, dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents] where each entry is int skill of that agent
-        skills_t = torch.nn.functional.one_hot(skills_t.long(), num_classes=self.num_skills).float() # shape [n_rollouts, num_agents, num_skills]
-        available_actions_t = torch.as_tensor(np.array(available_actions), dtype=torch.bool, device=self.device) # shape [n_rollouts, num_agents, num_actions]
+        skills_t = torch.as_tensor(skills_np, dtype=torch.float32, device=self.device) # shape [batch_size, num_agents] where each entry is int skill of that agent
+        skills_t = torch.nn.functional.one_hot(skills_t.long(), num_classes=self.num_skills).float() # shape [batch_size, num_agents, num_skills]
+        available_actions_t = torch.as_tensor(np.array(available_actions), dtype=torch.bool, device=self.device) # shape [batch_size, num_agents, num_actions]
 
-        # encoder obs: [n_rollouts, num_agents, H, W, C] -> [n_rollouts, num_agents, obs_dim]
+        # encoder obs: [batch_size, num_agents, H, W, C] -> [batch_size, num_agents, obs_dim]
         obs = self.obs_encoder(obs)
 
         # get Q-values for each low level action given skill
@@ -238,19 +256,22 @@ class HMARLModel:
 
     def assign_skills(self, share_obs, epsilon=None): 
         """ Assign skills to agents using high-level policy. Used in get_actions_algorithm. """
-        # share_obs: [n_rollouts, num_agents, H, W , C_share] where this is the shared observation available to all agents
-        # skills: [n_rollouts, num_agents,] where each entry is int skill of that agent
+        # share_obs: [batch_size, num_agents, H, W , C_share] where this is the shared observation available to all agents
+        # skills: [batch_size, num_agents,] where each entry is int skill of that agent
 
         # Transform into tensors & input form of share_obs_encoder
-        share_obs_np = np.array(share_obs)
-        batch_size = share_obs_np.shape[0]
-        share_obs = torch.as_tensor(share_obs_np, dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents, obs_dim] (obs per agent)
-        
+        batch_size = share_obs.shape[0]
+        share_obs = torch.as_tensor(share_obs, dtype=torch.float32, device=self.device) # shape [batch_size, num_agents, obs_dim] (obs per agent)
+        print("assign_skills input share_obs", share_obs.shape)
+
         # API requirement of share_obs_encoder: share_obs: [B, N, H, W, C_share] -> [B, N, state_dim]
         share_obs = self.share_obs_encoder(share_obs)
 
+        print("assign_skills input share_obs", share_obs.shape)
+
         with torch.no_grad():
-            q_values = self.agent_main(share_obs)[:, :self.num_skills] # get Q-values for each skill
+            q_values = self.agent_main(share_obs) # get Q-values for each skill
+            print("q_values shape", q_values.shape)
             skills_argmax = torch.argmax(q_values, dim=2).cpu().numpy() # select greedy skill per agent
 
         # ε-greedy exploration
@@ -262,7 +283,7 @@ class HMARLModel:
                 else:
                     skills[b, i] = int(skills_argmax[b, i])
 
-        return skills
+        return skills # shape: [batch_size, num_agents]
 
     ## --- End of Core action functions --- ##
 
@@ -483,8 +504,17 @@ class HMARLModel:
     
     @torch.no_grad()
     def reset(self):
-        """Reset internal skill storage """
-        self.current_skills = None
+        """Reset internal step counter, called at beginning of each episode or eval, render modes. """
+        self.step = 0
+
+    @staticmethod
+    def _format_actions(actions: np.ndarray) -> np.ndarray:
+        """
+        Ensure actions always have shape (..., num_agents, 1) so env's _action_convertor
+        receives indexable entries. So we add a dummy last dimension .
+        """
+        actions = actions[..., 1]
+        return actions
 
 
 
@@ -521,6 +551,9 @@ class HMARLModel:
         self.Q_low.eval()
         self.agent_main.eval()
         self.mixer_main.eval()
+
+        # reset internal skill storage
+        self.reset()
     
     def prep_training(self):
         self.decoder.train()

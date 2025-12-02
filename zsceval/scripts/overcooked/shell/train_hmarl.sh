@@ -16,7 +16,7 @@ fi
 reward_shaping_horizon="1e8"
 num_env_steps="1e7"
 
-num_agents=2
+num_agents=3
 algo="hmarl"
 exp="sp"
 seed_begin=11
@@ -37,7 +37,7 @@ for seed in $(seq ${seed_begin} ${seed_max});
 do
     echo "seed is ${seed}:"
     python ../train/train_hmarl.py --env_name ${env} --algorithm_name ${algo} --experiment_name ${exp} --layout_name ${layout} --num_agents ${num_agents} \
-    --agent_policy_names ppo ppo \
+    --agent_policy_names ppo ppo ppo \ # number of agents에 맞게 policy names 지정
     --seed ${seed} --n_training_threads 1 --n_rollout_threads 50 --dummy_batch_size 2 --num_mini_batch 1 --episode_length 400 --num_env_steps ${num_env_steps} --reward_shaping_horizon ${reward_shaping_horizon} \
     --overcooked_version ${version} \
     --ppo_epoch 15 --entropy_coefs ${entropy_coefs} --entropy_coef_horizons ${entropy_coef_horizons} \

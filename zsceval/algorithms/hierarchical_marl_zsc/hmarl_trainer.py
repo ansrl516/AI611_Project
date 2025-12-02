@@ -81,10 +81,9 @@ class HMARLTrainer(OvercookedRunner):
         else:
             self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int)
             self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
-            # agent-major: [agent][batch] lists
+            # env-major: [batch][agent] lists
             self.traj_per_agent = [
-                [[] for _ in range(self.batch_size)]
-                for _ in range(self.num_agents)
+                [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
             ]
 
         self.dataset = []
@@ -177,7 +176,7 @@ class HMARLTrainer(OvercookedRunner):
         
         # Infer effective batch size from obs shape (if no rollout dim, treat as single env with batch_size=0).
         obs_np = np.array(obs)
-        incoming_batch = obs_np.shape[0] if obs_np.ndim > 4 else 0
+        incoming_batch = obs_np.shape[0]
         assert incoming_batch == self.batch_size
         # if incoming_batch != self.batch_size:
         #     self.reset_internals(incoming_batch)
@@ -190,17 +189,20 @@ class HMARLTrainer(OvercookedRunner):
             # Flatten agent and batch dims → compute intrinsic rewards in one shot
             traj_flat = np.array(
                 [
-                    self.traj_per_agent[idx_agent][batch_idx][-self.steps_per_assign:]
-                    for idx_agent in range(self.num_agents)
+                    self.traj_per_agent[batch_idx][idx_agent][-self.steps_per_assign:]
                     for batch_idx in range(self.batch_size)
+                    for idx_agent in range(self.num_agents)
                 ]
             )  # shape: (num_agents * batch_size, steps_per_assign, H, W, C)
-            skills_flat = self.current_skills.T.reshape(-1)  # agent-major flatten
+            skills_flat = self.current_skills.reshape(-1)  # batch-major flatten
             ir_flat = self.hsd.compute_intrinsic_reward(traj_flat, skills_flat)  # shape: (num_agents * batch_size,)
-            self.intrinsic_rewards = ir_flat.reshape(self.num_agents, self.batch_size).T  # back to (batch, agents)
+            self.intrinsic_rewards = ir_flat.reshape(self.batch_size, self.num_agents)  # back to (batch, agents)
+        elif self.batch_size > 0:
+            # Not enough history yet; keep intrinsic rewards at zero until trajectories accumulate.
+            self.intrinsic_rewards[:] = 0.0
         else:
             for idx_agent in range(self.num_agents):
-                traj = np.array(self.traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape: (steps_per_assign, H, W, C) per agetn
+                traj = np.array(self.traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape: (steps_per_assign, H, W, C) per agent
                 self.intrinsic_rewards[idx_agent] = self.hsd.compute_intrinsic_reward(
                     traj, self.current_skills[idx_agent]
                 )
@@ -224,7 +226,7 @@ class HMARLTrainer(OvercookedRunner):
             else:
                 for batch_idx in range(self.batch_size):
                     for idx_agent in range(self.num_agents):
-                        self.dataset.append([self.traj_per_agent[idx_agent][batch_idx][-self.steps_per_assign:], self.current_skills[batch_idx][idx_agent]])
+                        self.dataset.append([self.traj_per_agent[batch_idx][idx_agent][-self.steps_per_assign:], self.current_skills[batch_idx][idx_agent]])
             # Reset accumulated high level rewards
             self.rewards_high = np.zeros_like(self.rewards_high)
 
@@ -233,8 +235,7 @@ class HMARLTrainer(OvercookedRunner):
                 self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
             else:
                 self.traj_per_agent = [
-                    [[] for _ in range(self.batch_size)]
-                    for _ in range(self.num_agents)
+                    [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
                 ]
 
         # Update trajectory per agent data structure
@@ -244,7 +245,7 @@ class HMARLTrainer(OvercookedRunner):
         else:
             for batch_idx in range(self.batch_size):
                 for idx_agent in range(self.num_agents):
-                    self.traj_per_agent[idx_agent][batch_idx].append((obs[batch_idx][idx_agent]))
+                    self.traj_per_agent[batch_idx][idx_agent].append((obs[batch_idx][idx_agent]))
     # Fetch low level actions during training mode, 
     # manages internal buffers, skill assignments, intrinsic rewards, high level rewards ... 
     @torch.no_grad()
@@ -265,24 +266,21 @@ class HMARLTrainer(OvercookedRunner):
 
         self.prep_rollout() # set eval mode for policy
 
-        # Infer batch size from leading dimension; if absent, treat as unbatched (batch_size=0) and add a dummy batch dim for policy call.
-        obs_np = np.array(obs)
-        incoming_batch = obs_np.shape[0] if obs_np.ndim > 4 else 0
+        
+        incoming_batch = obs.shape[0] 
+        print("batch_size_comparison ",incoming_batch, self.batch_size)
         assert incoming_batch == self.batch_size
-
-        if self.batch_size == 0:
-            obs_in = obs_np[np.newaxis, ...]
-            share_obs_in = np.array(share_obs)[np.newaxis, ...]
-            avail_in = np.array(available_actions)[np.newaxis, ...]
-        else:
-            obs_in = obs_np
-            share_obs_in = np.array(share_obs)
-            avail_in = np.array(available_actions)
 
         # Trainer internally includes policy, and updates buffers, current skills, intrinsic rewards, ... internally
         # so it only prints out actions, actual training algorithm of hmarl is hidden
         # skills_int is the newly assigned skills at this step (or is just the same skill within period)
-        actions = self.hsd.get_actions_algorithm(steps, obs_in, share_obs_in, avail_in, self.epsilon)
+        actions = self.hsd.get_actions_algorithm(
+            steps,
+            obs,
+            share_obs,
+            available_actions,
+            self.epsilon,
+        ).squeeze(-1) # shape: [batch_size, num_agents] where we collapse dummy dim 1
         skills_int = self.hsd.current_skills
 
         # At time of new skill assignment, update new skill and store it to current_skills
@@ -320,25 +318,24 @@ class HMARLTrainer(OvercookedRunner):
                         else:
                             actions[b, agent] = np.random.randint(self.num_actions)
 
-        return actions[0] if self.batch_size == 0 else actions # shape: [batch_size, num_agents] or [num_agents,] depending on batch_size with value 0 ~ num_actions-1
+        return self._format_actions_for_env(actions)
 
-    # Reset internal variables and storage at the before episode starts again (not used)
+    # Reset internal variables and storage at the before episode starts again (triggered if batch size changes)
     @torch.no_grad()
     def reset_internals(self, batch_size):
         self.batch_size = batch_size
-        self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int) if self.batch_size > 0 else np.zeros(self.num_agents, dtype=int)
+        self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int)
         self.obs_h = None
-        self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
+        self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
 
         if self.batch_size == 0:
             self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
         else:
             self.traj_per_agent = [
-                [[] for _ in range(self.num_agents)]
-                for _ in range(self.batch_size)
+                [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
             ]
 
-        self.rewards_high = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
+        self.rewards_high = np.zeros_like(self.current_skills)
 
     @torch.no_grad()
     def prep_rollout(self):
@@ -354,3 +351,11 @@ class HMARLTrainer(OvercookedRunner):
         os.makedirs(save_path, exist_ok=True)
         model_path = os.path.join(save_path, f"model_{step}.pt")
         self.hsd.save(model_path)
+
+    @staticmethod
+    def _format_actions_for_env(actions: np.ndarray) -> np.ndarray:
+        """
+        Env expects each action entry to be indexable (a[0]); wrap scalar actions with a
+        trailing singleton dimension.
+        """
+        return actions[..., 1]  # shape: (..., num_agents, 1)
