@@ -216,10 +216,10 @@ class HMARLModel:
         # 1. Assign skills at the beginning and every steps_per_assign
         if steps % self.steps_per_assign == 0:
             self.current_skills = self.assign_skills(shared_obs, epsilon=epsilon) # shape: [batch_size, num_agents]
-
+        print("current_skills", self.current_skills.shape)
         # 2. Get low-level actions using current skills
         actions = self.get_actions_low(obs, available_actions, self.current_skills) # shape: [batch_size, num_agents]
-
+        print("actions shape in get_actions_algorithm", actions.shape)
         return self._format_actions(actions) # returns shape: [batch_size, num_agents, 1] (final 1 is dummy)
 
     def get_actions_low(self, obs, available_actions, skills):
@@ -513,7 +513,7 @@ class HMARLModel:
         Ensure actions always have shape (..., num_agents, 1) so env's _action_convertor
         receives indexable entries. So we add a dummy last dimension .
         """
-        actions = actions[..., 1]
+        actions = np.expand_dims(actions, axis=-1)
         return actions
 
 

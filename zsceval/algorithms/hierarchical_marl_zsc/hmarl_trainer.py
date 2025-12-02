@@ -89,7 +89,7 @@ class HMARLTrainer(OvercookedRunner):
         self.dataset = []
         self.obs_h = None
         self.share_obs_h = None
-        self.rewards_high = np.zeros_like(self.current_skills)
+        self.rewards_high = np.zeros((self.batch_size, self.num_agents), dtype=float)
 
     # --- Core functions that is run only in shared overcookedhmarl runner (overcooked_runner_hmarl.py) --- #
 
@@ -165,6 +165,7 @@ class HMARLTrainer(OvercookedRunner):
             # "all_agent_obs" : np.array of shape (n_rollout_threads, num_agents, H, W, C)
             # "share_obs" : np.array of shape (n_rollout_threads, num_agents, H, W, C_share)
             # "available_actions" : np.array of shape (n_rollout_threads, num_agents, num_actions)
+            # "rewards": np.array of shape (n_rollout_threads, num_agents, 1)
             # "bad_transition" : bool - whether the transition is a bad transition
             # "episode" : dict - episode information
 
@@ -181,6 +182,9 @@ class HMARLTrainer(OvercookedRunner):
         # if incoming_batch != self.batch_size:
         #     self.reset_internals(incoming_batch)
         #     return
+
+        # remove last dim of rewards because it is dummy
+        rewards = rewards.squeeze(-1)  # shape: (batch_size, num_agents)
 
         # Update low-level buffer with intrinsic reward and store it into buffer
         self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
@@ -207,6 +211,8 @@ class HMARLTrainer(OvercookedRunner):
                     traj, self.current_skills[idx_agent]
                 )
 
+        print("rewards_shape:", rewards.shape)
+        print("intrinsic_rewards_shape:", self.intrinsic_rewards.shape)
         rewards_low = self.alpha * rewards + (1 - self.alpha) * self.intrinsic_rewards
 
         self.buf_low.add([obs, actions, rewards_low, self.current_skills, next_obs, dones])
@@ -281,6 +287,7 @@ class HMARLTrainer(OvercookedRunner):
             available_actions,
             self.epsilon,
         ).squeeze(-1) # shape: [batch_size, num_agents] where we collapse dummy dim 1
+        print("actions_shape_from_hsd ", actions.shape)
         skills_int = self.hsd.current_skills
 
         # At time of new skill assignment, update new skill and store it to current_skills
@@ -358,4 +365,5 @@ class HMARLTrainer(OvercookedRunner):
         Env expects each action entry to be indexable (a[0]); wrap scalar actions with a
         trailing singleton dimension.
         """
-        return actions[..., 1]  # shape: (..., num_agents, 1)
+        actions = np.expand_dims(actions, axis=-1)  # shape: (..., num_agents, 1)
+        return actions

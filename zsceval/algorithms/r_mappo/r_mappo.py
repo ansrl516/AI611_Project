@@ -60,7 +60,7 @@ class R_MAPPO:
             if self._use_policy_vhead:
                 self.policy_value_normalizer = None
 
-    def adapt_entropy_coef(self, num_steps: int):
+    def adapt_entropy_coef(self, num_steps: int): # 필수
         n = len(self.entropy_coef_horizons)
         for i in range(n - 1):
             if self.entropy_coef_horizons[i] <= num_steps < self.entropy_coef_horizons[i + 1]:
@@ -115,7 +115,7 @@ class R_MAPPO:
 
         return value_loss
 
-    def ppo_update(
+    def ppo_update( # 필수
         self,
         sample,
         turn_on: bool = True,

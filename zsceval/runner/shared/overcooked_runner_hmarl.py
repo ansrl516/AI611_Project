@@ -172,19 +172,19 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 # Sample actions based on recent environment interaction
                 # Trainer internally hides actual details, only prints out low level action
                 actions = self.collect(step, obs, share_obs, available_actions) # [n_rollout_threads, num_agents,] where each entry is action 0 ~ 5 
-
+                print("collected actions shape in run", actions.shape)
                 # Interact with the environment to get observations, rewards, and next observations
                 (
                     _obs_batch_single_agent,
                     share_obs_next,
-                    rewards,
+                    rewards, # shape: [n_rollout_threads, num_agents (actual), 1]
                     dones,
                     infos,
                     available_actions_next,
-                ) = self.envs.step(actions) # actions requirement: [n_rollout_threads, num_agents,]
+                ) = self.envs.step(actions) # actions requirement: [n_rollout_threads, num_agents, 1] 0 ~ 5
 
                 # ===>>> Extract all_agent_obs from info_list <<<===
-                obs_next = np.array([info['all_agent_obs'] for info in infos])
+                obs_next, share_obs_next, available_actions_next = self.info_translation(infos)
                 total_num_steps += self.n_rollout_threads
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
 
@@ -340,6 +340,14 @@ class OvercookedRunnerHMARL(OvercookedRunner):
     #     shape = input.shape
     #     return input.reshape(n_rollout_threads, shape[0] // n_rollout_threads, *shape[1:])
 
+    def info_translation(self, info_list):
+        # Extract data from info_list
+        all_agent_obs = np.array([info['all_agent_obs'] for info in info_list])
+        share_obs = np.array([info['share_obs'] for info in info_list])
+        available_actions = np.array([info['available_actions'] for info in info_list])
+        return all_agent_obs, share_obs, available_actions
+
+
     # from current step inside episode, collect actions and related variables for trainer
     # only used during training step
     @torch.no_grad()
@@ -468,6 +476,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 epsilon=0.0  # no exploration in eval
             )
             # actions = self.inverse_transform(actions, self.n_eval_rollout_threads)
+            print("eval actions shape:", actions.shape)
             # Step the environment
             (
                 _obs_single_agent,
@@ -479,7 +488,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             ) = self.eval_envs.step(actions) # actions requirement: [n_eval_rollout_threads, num_agents,]
 
             # Extract next obs
-            obs_next = np.array([info['all_agent_obs'] for info in infos])
+            obs_next, share_obs_next, available_actions_next = self.info_translation(infos)
 
             # Accumulate rewards
             episode_rewards += rewards
@@ -533,7 +542,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                     available_actions,
                     epsilon=0.0,
                 )
-
+                print("render actions shape:", actions.shape)
                 (
                     _obs_single_agent,
                     share_obs_next,
@@ -543,7 +552,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                     available_actions_next,
                 ) = envs.step(actions)
 
-                obs_next = np.array([info['all_agent_obs'] for info in infos])
+                obs_next, share_obs_next, available_actions_next = self.info_translation(infos)
 
                 episode_rewards += rewards
 
