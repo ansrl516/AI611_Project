@@ -20,6 +20,7 @@ def get_config() -> argparse.ArgumentParser:
         type=str,
         default="mappo",
         choices=[
+            "hmarl",
             "rmappo",
             "mappo",
             "population",  # Qs: what is this?
@@ -28,6 +29,7 @@ def get_config() -> argparse.ArgumentParser:
             "adaptive",
             "cole",
             "e3t",
+            "hmarl" # custom (only allowed to run overcookedhmarlrunner)
         ],
     )
 
@@ -107,7 +109,7 @@ def get_config() -> argparse.ArgumentParser:
     parser.add_argument(
         "--use_wandb",
         action="store_false",
-        default=True,
+        default=False,
         help="[for wandb usage], by default True, will log date to wandb server. or else will use tensorboard to log data.",
     )
 
@@ -117,7 +119,7 @@ def get_config() -> argparse.ArgumentParser:
         type=str,
         default="Overcooked",
         help="specify the name of environment",
-        choices=["Overcooked", "GRF"],
+        choices=["Overcooked", "Overcooked_new", "GRF"],
     )
     parser.add_argument(
         "--use_obs_instead_of_state",

@@ -1,0 +1,34 @@
+model_config = {
+    "param_sharing": "all_shared",
+
+    "obs_channels": 3,
+    "obs_height": 5,
+    "obs_width": 5,
+    "share_obs_channels": 3,
+
+    "num_agents": 2,
+    "num_actions": 6,
+    "num_skills": 4,
+    "state_dim": 64,
+    "obs_dim": 64,
+
+    "gamma": 0.99,
+    "tau": 0.01,
+    "lr_q": 5e-4,
+    "lr_decoder": 1e-3,
+
+    "steps_per_assign": 8,
+    "traj_skip": 2,
+    "use_state_difference": False,
+    "obs_truncate_length": None,
+
+    "n_h_decoder": 128,
+    "n_h1_low": 128,
+    "n_h2_low": 128,
+    "n_h1_high": 128,
+    "n_h2_high": 128,
+    "n_h_mixer": 64,
+
+    "batch_size": 1,
+    "device": "cuda"
+}

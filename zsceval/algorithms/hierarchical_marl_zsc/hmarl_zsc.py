@@ -14,7 +14,7 @@ class ExDataParallel(torch.nn.DataParallel):
 
 
 class Ego_HMARLPolicy:
-    def __init__(self, args, obs_space, share_obs_space, act_space, device=torch.device("cpu")):
+    def __init__(self, args, hmarl_path, obs_space, share_obs_space, act_space, device=torch.device("cpu")):
         self.device = device
         self.lr = args.lr
         self.critic_lr = args.critic_lr
@@ -26,6 +26,9 @@ class Ego_HMARLPolicy:
         self.act_space = act_space
 
         self.data_parallel = getattr(args, "data_parallel", False)
+
+        # loading pretrained HMARL_Model
+        self.hmarlpretrained = load pretrained frm hmarl_path # (TODO)
         
         """ 
         Manager is only trainable part of Ego Agent. It sees share_obs_space (trajectory of other partners, env, information from warmup) and outputs skill dimension action periodically.
