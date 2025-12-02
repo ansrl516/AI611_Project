@@ -5,6 +5,7 @@
 #!/usr/bin/env python
 import argparse
 import os
+os.chdir("/workspace") # Set working directory to the project root
 import pprint
 import socket
 import sys
@@ -83,7 +84,7 @@ def parse_args(args, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--hmarl_trainer_config_path",
         type=str,
-        default="zsceval/algorithms/hierarchical_marl_zsc/config/hmarl_trainer_config.pkl",
+        default="zsceval/algorithms/hierarchical_marl_zsc/configs/hmarl_trainer_config.pkl",
         help="Path to HMARL trainer config pickle.",
     )
     # all_args = parser.parse_known_args(args)[0]
@@ -130,6 +131,7 @@ def main(args):
     # wandb
     project_name = all_args.env_name + "-new"  # Always use overcooked_new
     if all_args.use_wandb:
+        print("Initialize wandb...")
         run = wandb.init(
             config=all_args,
             project=project_name,

@@ -109,7 +109,7 @@ def get_config() -> argparse.ArgumentParser:
     parser.add_argument(
         "--use_wandb",
         action="store_false",
-        default=True,
+        default=False,
         help="[for wandb usage], by default True, will log date to wandb server. or else will use tensorboard to log data.",
     )
 

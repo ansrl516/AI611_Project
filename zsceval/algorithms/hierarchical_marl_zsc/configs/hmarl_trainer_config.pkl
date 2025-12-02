@@ -29,10 +29,10 @@ config = {
     "model": {
         "param_sharing": "all_shared",
 
-        "obs_channels": 3,
+        "obs_channels": 25,
         "obs_height": 5,
-        "obs_width": 5,
-        "share_obs_channels": 3,
+        "obs_width": 4,
+        "share_obs_channels": 20,
 
         "num_agents": 2,
         "num_actions": 6,

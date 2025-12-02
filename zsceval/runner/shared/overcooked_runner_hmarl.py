@@ -90,9 +90,11 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         
         # load HMARL specific parameters from specific config directory
         trainer_cfg_path = self.all_args.hmarl_trainer_config_path
-        with open(trainer_cfg_path, "rb") as f:
-            trainer_cfg = pickle.load(f)
-        model_cfg = trainer_cfg["model_cfg"] # trainer config includes model config inside
+        cfg_namespace = {}
+        with open(trainer_cfg_path, "r") as f:
+            exec(f.read(), cfg_namespace)
+        trainer_cfg = cfg_namespace["config"]["trainer"]
+        model_cfg = cfg_namespace["config"]["model"]  # trainer config includes model config inside
 
         # =====================================================================
         # Override some parts of the PKL configs according to runtime all_args
@@ -111,15 +113,14 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         model_cfg["act_space"] = self.envs.action_space
         # Whether we use obs instead of state (for centralized critic)
         model_cfg["use_obs_instead_of_state"] = self.use_obs_instead_of_state
-        # Actual dims must match environment spaces
-        model_cfg["obs_dim"] = int(np.prod(self.envs.observation_space[0].shape))
-        model_cfg["state_dim"] = (
-            int(np.prod(self.envs.share_observation_space[0].shape))
-            if not self.use_obs_instead_of_state
-            else int(np.prod(self.envs.observation_space[0].shape))
-        )
+
         # These come from env action space (not PKL)
+        print(self.envs.observation_space, self.envs.share_observation_space, self.envs.action_space)
         model_cfg["num_actions"] = self.envs.action_space[0].n
+        model_cfg["obs_channels"] = self.envs.observation_space[0].shape[-1]
+        model_cfg["share_obs_channels"] = self.envs.share_observation_space[0].shape[-1]
+        model_cfg["obs_height"] = self.envs.observation_space[0].shape[0]
+        model_cfg["obs_width"] = self.envs.observation_space[0].shape[1]
         # -----------------------
         # Override trainer config
         # -----------------------
@@ -133,8 +134,9 @@ class OvercookedRunnerHMARL(OvercookedRunner):
 
         # Create instance of algorithm 
         TrainAlgo, Policy = HMARLTrainer, HMARLModel
-        self.trainer = TrainAlgo(trainer_cfg, model_cfg, self.device) # internally creates policy
-        self.policy = self.trainer.hsd
+        combined_cfg = {"trainer": trainer_cfg, "model": model_cfg}
+        self.trainer = TrainAlgo(combined_cfg, self.device)
+        self.policy = self.trainer.hsd  # ensure policy is from trainer
 
         # dump policy config to allow loading population in yaml form
         self.policy_config = model_cfg

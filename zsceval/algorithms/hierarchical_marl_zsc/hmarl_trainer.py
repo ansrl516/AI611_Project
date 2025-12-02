@@ -5,7 +5,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
+import os
 
+from zsceval.runner.shared.overcooked_runner import OvercookedRunner
 from zsceval.algorithms.hierarchical_marl_zsc.hmarl_policy import HMARLModel
 from zsceval.algorithms.hierarchical_marl_zsc.utils.replay_buffer import Replay_Buffer
 
@@ -13,10 +15,11 @@ from zsceval.algorithms.hierarchical_marl_zsc.utils.replay_buffer import Replay_
 # In training, it is wrapped with simplest runner which not compatible with base_runner
 # After training, it provides functions other policies can use (decoder, assign_skills, get_actions, ...)
 #                 it has function which creates fixed Agent Instances
-class HMARLTrainer:
+class HMARLTrainer(OvercookedRunner):
     """Wrapper to bridge ZSC env messaging with HMARL policy/trainer."""
 
     def __init__(self, config, device=torch.device("cpu")):
+
 
         # Extract structured configs
         cfg_tr = config["trainer"]
@@ -78,9 +81,10 @@ class HMARLTrainer:
         else:
             self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int)
             self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
+            # agent-major: [agent][batch] lists
             self.traj_per_agent = [
-                [[] for _ in range(self.num_agents)]
-                for _ in range(self.batch_size)
+                [[] for _ in range(self.batch_size)]
+                for _ in range(self.num_agents)
             ]
 
         self.dataset = []
@@ -174,22 +178,29 @@ class HMARLTrainer:
         # Infer effective batch size from obs shape (if no rollout dim, treat as single env with batch_size=0).
         obs_np = np.array(obs)
         incoming_batch = obs_np.shape[0] if obs_np.ndim > 4 else 0
-        if incoming_batch != self.batch_size:
-            self.reset_internals(incoming_batch)
+        assert incoming_batch == self.batch_size
+        # if incoming_batch != self.batch_size:
+        #     self.reset_internals(incoming_batch)
+        #     return
 
         # Update low-level buffer with intrinsic reward and store it into buffer
         self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)
 
-        if self.batch_size > 0:
-            for batch_idx in range(self.batch_size):
-                for idx_agent in range(self.num_agents):
-                    traj = np.array(self.traj_per_agent[batch_idx][idx_agent][-self.steps_per_assign:])  # shape [obs_dim]
-                    self.intrinsic_rewards[batch_idx][idx_agent] = self.hsd.compute_intrinsic_reward(
-                        traj, self.current_skills[batch_idx][idx_agent]
-                    )
+        if self.batch_size > 0 and steps > self.steps_per_assign:
+            # Flatten agent and batch dims → compute intrinsic rewards in one shot
+            traj_flat = np.array(
+                [
+                    self.traj_per_agent[idx_agent][batch_idx][-self.steps_per_assign:]
+                    for idx_agent in range(self.num_agents)
+                    for batch_idx in range(self.batch_size)
+                ]
+            )  # shape: (num_agents * batch_size, steps_per_assign, H, W, C)
+            skills_flat = self.current_skills.T.reshape(-1)  # agent-major flatten
+            ir_flat = self.hsd.compute_intrinsic_reward(traj_flat, skills_flat)  # shape: (num_agents * batch_size,)
+            self.intrinsic_rewards = ir_flat.reshape(self.num_agents, self.batch_size).T  # back to (batch, agents)
         else:
             for idx_agent in range(self.num_agents):
-                traj = np.array(self.traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape [obs_dim]
+                traj = np.array(self.traj_per_agent[idx_agent][-self.steps_per_assign:])  # shape: (steps_per_assign, H, W, C) per agetn
                 self.intrinsic_rewards[idx_agent] = self.hsd.compute_intrinsic_reward(
                     traj, self.current_skills[idx_agent]
                 )
@@ -205,18 +216,6 @@ class HMARLTrainer:
         if (steps+1) % self.steps_per_assign == 0 and steps != 0:
             self.buf_high.add([self.obs_h, self.share_obs_h, self.current_skills, self.rewards_high, next_obs, next_share_obs, dones])
             
-            # Reset accumulated high level rewards
-            self.rewards_high = np.zeros_like(self.rewards_high)
-
-            # Reset trajectory per agent data structure
-            if self.batch_size == 0:
-                self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
-            else:
-                self.traj_per_agent = [
-                    [[] for _ in range(self.num_agents)]
-                    for _ in range(self.batch_size)
-                ]
-
             # Append skill-trajectory to dataset for training decoder (regardless of agent and batch)
             # note if size of dataset exceeds threshold, clearing decoder is done in training_step
             if self.batch_size == 0:
@@ -225,11 +224,18 @@ class HMARLTrainer:
             else:
                 for batch_idx in range(self.batch_size):
                     for idx_agent in range(self.num_agents):
-                        self.dataset.append([self.traj_per_agent[batch_idx][idx_agent][-self.steps_per_assign:], self.current_skills[batch_idx][idx_agent]])
-        
-            # Update starting obs of the period
-            self.obs_h = next_obs
-            self.share_obs_h = next_share_obs
+                        self.dataset.append([self.traj_per_agent[idx_agent][batch_idx][-self.steps_per_assign:], self.current_skills[batch_idx][idx_agent]])
+            # Reset accumulated high level rewards
+            self.rewards_high = np.zeros_like(self.rewards_high)
+
+            # Reset trajectory per agent data structure
+            if self.batch_size == 0:
+                self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
+            else:
+                self.traj_per_agent = [
+                    [[] for _ in range(self.batch_size)]
+                    for _ in range(self.num_agents)
+                ]
 
         # Update trajectory per agent data structure
         if self.batch_size == 0:
@@ -238,7 +244,7 @@ class HMARLTrainer:
         else:
             for batch_idx in range(self.batch_size):
                 for idx_agent in range(self.num_agents):
-                    self.traj_per_agent[batch_idx][idx_agent].append((obs[batch_idx][idx_agent]))
+                    self.traj_per_agent[idx_agent][batch_idx].append((obs[batch_idx][idx_agent]))
     # Fetch low level actions during training mode, 
     # manages internal buffers, skill assignments, intrinsic rewards, high level rewards ... 
     @torch.no_grad()
@@ -262,8 +268,7 @@ class HMARLTrainer:
         # Infer batch size from leading dimension; if absent, treat as unbatched (batch_size=0) and add a dummy batch dim for policy call.
         obs_np = np.array(obs)
         incoming_batch = obs_np.shape[0] if obs_np.ndim > 4 else 0
-        if incoming_batch != self.batch_size:
-            self.reset_internals(incoming_batch)
+        assert incoming_batch == self.batch_size
 
         if self.batch_size == 0:
             obs_in = obs_np[np.newaxis, ...]
@@ -282,6 +287,8 @@ class HMARLTrainer:
 
         # At time of new skill assignment, update new skill and store it to current_skills
         if steps % self.steps_per_assign == 0:
+            self.obs_h = obs
+            self.share_obs_h = share_obs
 
             # Update new skills (balance between exploration and exploitation)
             if steps < self.pretrain_episodes: # random skill assignment during warmup
@@ -315,7 +322,7 @@ class HMARLTrainer:
 
         return actions[0] if self.batch_size == 0 else actions # shape: [batch_size, num_agents] or [num_agents,] depending on batch_size with value 0 ~ num_actions-1
 
-    # Reset internal variables and storage at the before episode starts again
+    # Reset internal variables and storage at the before episode starts again (not used)
     @torch.no_grad()
     def reset_internals(self, batch_size):
         self.batch_size = batch_size
@@ -327,8 +334,8 @@ class HMARLTrainer:
             self.traj_per_agent = [ [] for _ in range(self.num_agents) ]
         else:
             self.traj_per_agent = [
-                [[] for _ in range(self.batch_size)]
-                for _ in range(self.num_agents)
+                [[] for _ in range(self.num_agents)]
+                for _ in range(self.batch_size)
             ]
 
         self.rewards_high = np.zeros((self.batch_size, self.num_agents)) if self.batch_size > 0 else np.zeros(self.num_agents)

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-import utils.networks as networks
+import zsceval.algorithms.hierarchical_marl_zsc.utils.networks as networks
 
 
 def hard_update(target, source):
@@ -77,8 +77,8 @@ class HMARLModel:
             "n_h_decoder": cfg_m["n_h_decoder"],
             "n_h1_low": cfg_m["n_h1_low"],
             "n_h2_low": cfg_m["n_h2_low"],
-            "n_h1": cfg_m["n_h1_high"],
-            "n_h2": cfg_m["n_h2_high"],
+            "n_h1_high": cfg_m["n_h1_high"],
+            "n_h2_high": cfg_m["n_h2_high"],
             "n_h_mixer": cfg_m["n_h_mixer"],
         }
 
@@ -222,7 +222,7 @@ class HMARLModel:
         available_actions_t = torch.as_tensor(np.array(available_actions), dtype=torch.bool, device=self.device) # shape [n_rollouts, num_agents, num_actions]
 
         # encoder obs: [n_rollouts, num_agents, H, W, C] -> [n_rollouts, num_agents, obs_dim]
-        obs = self.obs_encoder(obs, device=self.device)
+        obs = self.obs_encoder(obs)
 
         # get Q-values for each low level action given skill
         with torch.no_grad():
@@ -247,7 +247,7 @@ class HMARLModel:
         share_obs = torch.as_tensor(share_obs_np, dtype=torch.float32, device=self.device) # shape [n_rollouts, num_agents, obs_dim] (obs per agent)
         
         # API requirement of share_obs_encoder: share_obs: [B, N, H, W, C_share] -> [B, N, state_dim]
-        share_obs = self.share_obs_encoder(share_obs, device=self.device)
+        share_obs = self.share_obs_encoder(share_obs)
 
         with torch.no_grad():
             q_values = self.agent_main(share_obs)[:, :self.num_skills] # get Q-values for each skill
@@ -303,10 +303,10 @@ class HMARLModel:
         done_t = torch.as_tensor(done, dtype=torch.float32, device=self.device)
 
         # encode obs and state using encoder
-        obs_t = self.obs_encoder(obs_t, device=self.device) # change obs_t into shape [n_steps * batch, num_agents, obs_dim]
-        state_t = self.share_obs_encoder(state_t, device=self.device) # change state_t into shape [n_steps * batch, num_agents, state_dim]
-        obs_next_t = self.obs_encoder(obs_next_t, device=self.device) # change obs_next_t into shape [n_steps * batch, num_agents, obs_dim]
-        state_next_t = self.share_obs_encoder(state_next_t, device=self.device) # change state_next_t into shape [n_steps * batch, num_agents, state_dim]
+        obs_t = self.obs_encoder(obs_t) # change obs_t into shape [n_steps * batch, num_agents, obs_dim]
+        state_t = self.share_obs_encoder(state_t) # change state_t into shape [n_steps * batch, num_agents, state_dim]
+        obs_next_t = self.obs_encoder(obs_next_t) # change obs_next_t into shape [n_steps * batch, num_agents, obs_dim]
+        state_next_t = self.share_obs_encoder(state_next_t) # change state_next_t into shape [n_steps * batch, num_agents, state_dim]
 
         # change skills_t into one-hot (num_steps * batch, num_agents, num_skills)
         skills_t = torch.nn.functional.one_hot(skills_t, num_classes=self.num_skills).float()
@@ -384,8 +384,8 @@ class HMARLModel:
         done_t = torch.as_tensor(done, dtype=torch.float32, device=self.device)
 
         # encode obs using encoder
-        obs_t = self.obs_encoder(obs_t, device=self.device) # change obs_t into shape [n_steps * batch, num_agents, obs_dim]
-        obs_next_t = self.obs_encoder(obs_next_t, device=self.device) # change obs_next_t into shape [n_steps *
+        obs_t = self.obs_encoder(obs_t) # change obs_t into shape [n_steps * batch, num_agents, obs_dim]
+        obs_next_t = self.obs_encoder(obs_next_t) # change obs_next_t into shape [n_steps * batch, num_agents, obs_dim]
 
         # change skills_t into one-hot (num_steps * batch, num_agents, num_skills)
         skills_t = torch.nn.functional.one_hot(skills_t, num_classes=self.num_skills).float()
@@ -416,7 +416,7 @@ class HMARLModel:
 
         networks.soft_update(self.Q_low_target, self.Q_low, self.tau)
 
-    def _downsample_traj(self, obs): # helper function for decoder
+    def _downsample_traj(self, obs): # helper function for decoder (shape of obs: [batch, traj_length, obs_dim])
         obs_downsampled = obs[:, :: self.traj_skip, :]
         if self.obs_truncate_length:
             obs_downsampled = obs_downsampled[:, :, : self.obs_truncate_length]
@@ -440,7 +440,7 @@ class HMARLModel:
         skills = torch.as_tensor(np.array(skills), dtype=torch.long, device=self.device)
 
         # encode obs using encoder (change into shape [batch, traj_length, obs_dim])
-        obs = self.obs_encoder(obs, device=self.device)
+        obs = self.obs_encoder(obs)
 
         # downsample trajectory
         obs_downsampled = self._downsample_traj(obs) # shape [batch, traj_length_downsampled, obs_dim]
@@ -461,11 +461,15 @@ class HMARLModel:
 
     def compute_intrinsic_reward(self, agents_traj_obs, skills): # gives decoder classification loss which is used during training
         # agents_traj_obs: np.array of shape (batch, traj_length, H, W, C)
-        agents_traj_obs = torch.as_tensor(np.array(agents_traj_obs), dtype=torch.float32, device=self.device)
-        
-        # encode obs using encoder (change into shape [batch, traj_length, obs_dim])
+        traj_np = np.array(agents_traj_obs)
+        B, T = traj_np.shape[0], traj_np.shape[1]
+
+        # Flatten time into batch for encoding, then restore [B, T, obs_dim]
+        traj_flat = traj_np.reshape(B * T, *traj_np.shape[2:])  # (B*T, H, W, C)
+        traj_flat = torch.as_tensor(traj_flat, dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            agents_traj_obs = self.obs_encoder(agents_traj_obs, device=self.device) 
+            obs_encoded = self.obs_encoder(traj_flat)  # (B*T, obs_dim)
+        agents_traj_obs = obs_encoded.reshape(B, T, -1)
 
         # downsample trajectory
         traj_t = self._downsample_traj(agents_traj_obs)

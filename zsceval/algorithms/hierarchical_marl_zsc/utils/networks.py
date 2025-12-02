@@ -223,8 +223,8 @@ class QmixSingle(nn.Module):
 
         elif obs.dim() == 3:
             # (B, N, F)
-            B, N, F = obs.shape
-            x = obs.reshape(B * N, F)
+            B, N, D = obs.shape
+            x = obs.reshape(B * N, D)
             x = F.relu(self.fc1(x))
             x = F.relu(self.fc2(x))
             x = self.out(x)
@@ -249,20 +249,19 @@ class QLow(nn.Module):
         """
 
         if obs.dim() == 2:
-            # (N, F_obs), (N, F_role)
+            # (N, D_obs), (N, D_role)
             x = torch.cat([obs, role], dim=1)
             x = F.relu(self.fc1(x))
             x = F.relu(self.fc2(x))
             return self.out(x)
 
         elif obs.dim() == 3:
-            # (B, N, F_obs), (B, N, F_role)
-            B, N, F_obs = obs.shape
-            _, _, F_role = role.shape
+            # (B, N, D_obs), (B, N, D_role)
+            B, N, D_obs = obs.shape
+            _, _, D_role = role.shape
 
-            x = torch.cat([obs, role], dim=2)  # (B, N, F_obs+F_role)
-            x = x.reshape(B * N, F_obs + F_role)
-
+            x = torch.cat([obs, role], dim=2)  # (B, N, D_obs+D_role)
+            x = x.reshape(B * N, D_obs + D_role)
             x = F.relu(self.fc1(x))
             x = F.relu(self.fc2(x))
             x = self.out(x)
@@ -319,7 +318,7 @@ class QmixMixer(nn.Module):
     def forward(self, agent_qs, state):
         """
         agent_qs: (N, n_agents) or (B, N, n_agents)
-        state:    (N, F_s)     or (B, N, F_s)
+        state:    (N, D_s)     or (B, N, D_s)
         """
 
         if agent_qs.dim() == 2:
