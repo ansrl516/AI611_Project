@@ -48,6 +48,10 @@ def make_trainer_policy_cls(algorithm_name, use_single_network=False):
             "zsceval.algorithms.population.traj.Traj_Trainer",
             "zsceval.algorithms.population.policy_pool.PolicyPool",
         ),
+        "hmarl": (
+            "zsceval.algorithms.hmarl.hmarl_trainer.HMARLTrainer",
+            "zsceval.algorithms.hmarl.hmarl_policy.HMARLModel",
+        ),
     }
 
     if algorithm_name not in algorithm_dict:

@@ -5,6 +5,7 @@
 #!/usr/bin/env python
 import argparse
 import os
+os.chdir("/workspace") # Set working directory to the project root
 import pprint
 import socket
 import sys
@@ -80,6 +81,12 @@ def parse_args(args, parser: argparse.ArgumentParser):
     )
 
     parser.add_argument("--use_task_v_out", default=False, action="store_true")
+    parser.add_argument(
+        "--hmarl_trainer_config_path",
+        type=str,
+        default="zsceval/algorithms/hierarchical_marl_zsc/configs/hmarl_trainer_config.pkl",
+        help="Path to HMARL trainer config pickle.",
+    )
     # all_args = parser.parse_known_args(args)[0]
     all_args = parser.parse_args(args)
     from zsceval.overcooked_config import OLD_LAYOUTS
@@ -124,6 +131,7 @@ def main(args):
     # wandb
     project_name = all_args.env_name + "-new"  # Always use overcooked_new
     if all_args.use_wandb:
+        print("Initialize wandb...")
         run = wandb.init(
             config=all_args,
             project=project_name,
@@ -186,19 +194,21 @@ def main(args):
         "run_dir": run_dir,
     }
 
-    # run experiments with hmarl, we don't use runner here
-    from hmarl_trainer import HMARLTrainer
-    trainer = HMARLTrainer(config, envs)
-    trainer.train()
+    # run experiments with hmarl using our custom runner
+    from zsceval.runner.shared.overcooked_runner_hmarl import OvercookedRunnerHMARL as Runner
+    runner = Runner(config)
+    runner.run()
     envs.close()
 
     # post process
     if all_args.use_eval and eval_envs is not envs:
         eval_envs.close()
-        run.finish(quiet=True)
-    # else:
-    #     runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
-    #     runner.writter.close() 
+        if all_args.use_wandb:
+            run.finish(quiet=True)
+    else:
+        if not all_args.use_wandb and hasattr(runner, "writter"):
+            runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
+            runner.writter.close() 
 
 
 if __name__ == "__main__":
