@@ -1,7 +1,11 @@
 #!/bin/bash
 env="Overcooked_new"
 
-layout="cramped_room"
+layout="asymmetric_advantages_2p"
+# asymmetric_advantages_2p, asymmetric_advantages_3p, asymmetric_advantages_4p
+# counter_circuit_2p, counter_circuit_3p, counter_circuit_4p
+# forced_coordination_2p, forced_coordination_3p, forced_coordination_4p
+
 cuda_device=${2:-0}  # Second argument for CUDA device, default to 0
 # Always use NEW version for all layouts
 version="new"
