@@ -125,7 +125,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         # Override trainer config
         # -----------------------
         # HMARLTrainer’s batch_size = number of parallel rollout envs
-        trainer_cfg["batch_size"] = self.all_args.n_rollout_threads * self.all_args.dummy_batch_size
+        trainer_cfg["batch_size"] = self.all_args.n_rollout_threads
         # Number of skills in trainer must match model
         trainer_cfg["N_skills"] = model_cfg["num_skills"]
         # Ensure steps_per_assign is mirrored
@@ -369,10 +369,10 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         # obs = self.transform(obs)
         # share_obs = self.transform(share_obs)
         # actions = self.transform(actions)
-        rewards = self.transform(rewards)
-        obs_next = self.transform(obs_next)
-        share_obs_next = self.transform(share_obs_next)
-        dones = self.transform(dones)
+        # rewards = self.transform(rewards)
+        # obs_next = self.transform(obs_next)
+        # share_obs_next = self.transform(share_obs_next)
+        # dones = self.transform(dones)
 
         self.trainer.update_buffer(
             step,
