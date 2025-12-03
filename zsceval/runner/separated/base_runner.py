@@ -333,6 +333,7 @@ class Runner:
                 self.policy[agent_id].critic.load_state_dict(policy_critic_state_dict)
 
     def log_train(self, train_infos, total_num_steps):
+        print(train_infos)
         for agent_id in range(self.num_agents):
             for k, v in train_infos[agent_id].items():
                 if isinstance(v, Iterable):
