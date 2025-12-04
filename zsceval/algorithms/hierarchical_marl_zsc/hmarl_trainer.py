@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections import deque
+import copy
 
 import numpy as np
 import torch
@@ -89,53 +90,63 @@ class HMARLTrainer(OvercookedRunner):
         self.obs_h = None
         self.share_obs_h = None
         self.rewards_high = np.zeros((self.batch_size, self.num_agents), dtype=float)
+        # Track aggregated high-level rewards per skill for logging (rewards_high gets reset each period)
+        self.episode_high_level_rewards = []
+        # Global env step tracker to gate pretraining / updates (episode step counter is too small)
+        self.total_env_steps = 0
+        self.next_train_step = self.steps_per_train
 
     ## --- Core functions that is run only in shared overcookedhmarl runner (overcooked_runner_hmarl.py) --- ##
 
     # Update Q_low, Q_high, decoder based on internal buffer and counter using internals
-    def training_step(self, episode_step): 
+    def training_step(self, _unused: int = 0): 
         # Set training mode for policy
         self.prep_training()
 
-        # LOW LEVEL UPDATE (frequent)
-        do_low_update = (
-            episode_step >= self.pretrain_episodes
-            and episode_step % self.steps_per_train == 0
-        )   
-        
-        if do_low_update:
-            batch_low = self.buf_low.sample_batch(self.batch_size)
-            self.hsd.train_policy_low(batch_low)
+        # Align update schedule so we do not skip pending multiples of steps_per_train
+        if self.total_env_steps >= self.pretrain_episodes and self.next_train_step < self.pretrain_episodes:
+            self.next_train_step = self.pretrain_episodes
 
-        # HIGH LEVEL UPDATE (slow)
-        do_high_update = (
-            episode_step % self.steps_per_train == 0 
-            and episode_step >= self.pretrain_episodes
-        )
-
-        if do_high_update:
-            batch_high = self.buf_high.sample_batch(self.batch_size)
-            self.hsd.train_policy_high(batch_high)
-
-        # --- DECODER UPDATE ---
+        updates_done = 0
         expected_prob = None
-        if len(self.dataset) >= self.decoder_training_threshold:
-            expected_prob = self.hsd.train_decoder(self.dataset)
-            self.dataset = []
+
+        while self.total_env_steps >= self.next_train_step:
+            # LOW LEVEL UPDATE (frequent)
+            if self.total_env_steps >= self.pretrain_episodes:
+                batch_low = self.buf_low.sample_batch(self.batch_size)
+                self.hsd.train_policy_low(batch_low)
+
+                # HIGH LEVEL UPDATE (slow)
+                batch_high = self.buf_high.sample_batch(self.batch_size)
+                self.hsd.train_policy_high(batch_high)
+                updates_done += 1
+
+                # Decoder update (may run multiple times if dataset large)
+                if len(self.dataset) >= self.decoder_training_threshold:
+                    expected_prob = self.hsd.train_decoder(self.dataset)
+                    self.dataset = []
+
+            self.next_train_step += self.steps_per_train
 
         # --- EPSILON / ALPHA SCHEDULE ---
-        if episode_step >= self.pretrain_episodes:
-            self.epsilon = max(self.epsilon_end, self.epsilon - self.epsilon_step)
+        if updates_done > 0 and self.total_env_steps >= self.pretrain_episodes:
+            self.epsilon = max(self.epsilon_end, self.epsilon - self.epsilon_step * updates_done)
 
-        if self.alpha < self.alpha_threshold:
-            self.alpha = min(self.alpha_threshold, self.alpha + self.alpha_step)
+        if self.alpha < self.alpha_threshold and updates_done > 0:
+            self.alpha = min(self.alpha_threshold, self.alpha + self.alpha_step * updates_done)
+
+        # Snapshot the high-level rewards collected over skill periods within the episode
+        if self.episode_high_level_rewards:
+            high_level_reward_mean = float(np.mean(self.episode_high_level_rewards))
+        else:
+            high_level_reward_mean = 0.0
 
         # --- Logging ---
         train_infos = {
             "epsilon": float(self.epsilon),
             "alpha": float(self.alpha),
             "intrinsic_reward_mean": float(np.mean(self.intrinsic_rewards)),
-            "high_level_reward_mean": float(np.mean(self.rewards_high))
+            "high_level_reward_mean": high_level_reward_mean,
         }
 
         if expected_prob is not None:
@@ -240,6 +251,11 @@ class HMARLTrainer(OvercookedRunner):
                 pass
 
         # ---------------------------------------------------
+        # 4-1) Optional scaling of intrinsic reward strength
+        # ---------------------------------------------------
+        self.intrinsic_rewards *= 0.1  # reduce impact to 10%
+
+        # ---------------------------------------------------
         # 5) Low-level reward: mix extrinsic & intrinsic
         #    rewards_low = alpha * env + (1 - alpha) * intrinsic
         # ---------------------------------------------------
@@ -266,6 +282,9 @@ class HMARLTrainer(OvercookedRunner):
         is_end_of_skill = (steps + 1) % self.steps_per_assign == 0 and steps != 0
 
         if is_end_of_skill:
+            # Cache aggregated reward for logging before it gets reset
+            self.episode_high_level_rewards.append(float(np.mean(self.rewards_high)))
+
             # 8-1) Add high-level transition to buffer
             self.buf_high.add(
                 [
@@ -302,6 +321,11 @@ class HMARLTrainer(OvercookedRunner):
             for ag in range(self.num_agents):
                 self.traj_per_agent[b][ag].append(obs[b][ag])
 
+        # ---------------------------------------------------
+        # 10) Advance global step counter
+        # ---------------------------------------------------
+        self.total_env_steps += 1
+
     # Fetch low level actions during training mode, 
     # manages internal buffers, skill assignments, intrinsic rewards, high level rewards ... 
     @torch.no_grad()
@@ -314,6 +338,11 @@ class HMARLTrainer(OvercookedRunner):
         """
 
         self.prep_rollout()   # eval mode
+
+        # Start of a new episode; reset trackers that span a full episode
+        if steps == 0:
+            self.episode_high_level_rewards = []
+            self.rewards_high = np.zeros_like(self.rewards_high, dtype=np.float32)
 
         # ---------------------------------------
         # 1) Validate batch size
@@ -350,7 +379,7 @@ class HMARLTrainer(OvercookedRunner):
             self.share_obs_h = share_obs
 
             # pretrain: assign random skills
-            if steps < self.pretrain_episodes:
+            if self.total_env_steps < self.pretrain_episodes:
                 self.current_skills = np.random.randint(
                     0, self.N_skills, size=(self.batch_size, self.num_agents)
                 )
@@ -362,7 +391,7 @@ class HMARLTrainer(OvercookedRunner):
         # 4) Pretraining: override low-level actions ONLY during warmup
         #    (random actions consistent with available_actions)
         # ---------------------------------------
-        if steps < self.pretrain_episodes:
+        if self.total_env_steps < self.pretrain_episodes:
             actions = np.zeros((self.batch_size, self.num_agents), dtype=np.int32)
             for b in range(self.batch_size):
                 for ag in range(self.num_agents):
@@ -413,3 +442,77 @@ class HMARLTrainer(OvercookedRunner):
         """
         actions = np.expand_dims(actions, axis=-1)  # shape: (..., num_agents, 1)
         return actions
+
+class HMARLTrainer_PerAgent(HMARLTrainer):
+    """
+    Single-agent wrapper around HMARLTrainer.
+    Behaves identically but accepts per-agent inputs (no agent dimension) and
+    internally expands them to match the base multi-agent shapes.
+    """
+
+    def __init__(self, config, device=torch.device("cpu")):
+        cfg_single = copy.deepcopy(config)
+        cfg_single["model"]["num_agents"] = 1
+        super().__init__(cfg_single, device=device)
+
+    @torch.no_grad()
+    def get_actions_algorithm(self, steps, obs, share_obs, available_actions):
+        obs_exp = np.expand_dims(obs, axis=1)
+        share_exp = np.expand_dims(share_obs, axis=1) if share_obs is not None else None
+        avail_exp = np.expand_dims(available_actions, axis=1)
+
+        actions = super().get_actions_algorithm(steps, obs_exp, share_exp, avail_exp)
+        return np.squeeze(actions, axis=1)
+
+    @torch.no_grad()
+    def update_buffer(self, steps, obs, share_obs, actions, rewards, next_obs, next_share_obs, dones):
+        actions_arr = np.asarray(actions)
+        if actions_arr.ndim == 1:
+            actions_arr = actions_arr[:, None]
+        if actions_arr.ndim > 2 and actions_arr.shape[-1] == 1:
+            actions_arr = actions_arr.squeeze(-1)
+        if actions_arr.ndim == 2 and actions_arr.shape[1] != 1:
+            actions_arr = actions_arr[:, None]
+
+        rewards_arr = np.asarray(rewards)
+        if rewards_arr.ndim == 1:
+            rewards_arr = rewards_arr[:, None]
+        if rewards_arr.ndim == 3 and rewards_arr.shape[-1] == 1:
+            rewards_arr = rewards_arr.squeeze(-1)
+        if rewards_arr.ndim == 2 and rewards_arr.shape[1] != 1:
+            rewards_arr = rewards_arr[:, None]
+
+        dones_arr = np.asarray(dones)
+        if dones_arr.ndim == 1:
+            dones_arr = dones_arr[:, None]
+        if dones_arr.ndim == 3 and dones_arr.shape[-1] == 1:
+            dones_arr = dones_arr.squeeze(-1)
+        if dones_arr.ndim == 2 and dones_arr.shape[1] != 1:
+            dones_arr = dones_arr[:, None]
+
+        return super().update_buffer(
+            steps,
+            np.expand_dims(obs, axis=1),
+            np.expand_dims(share_obs, axis=1) if share_obs is not None else None,
+            actions_arr,
+            rewards_arr,
+            np.expand_dims(next_obs, axis=1),
+            np.expand_dims(next_share_obs, axis=1) if next_share_obs is not None else None,
+            dones_arr,
+        )
+
+
+# FrozenTrainer Class that wraps pretrained HMARL policies
+class FrozenTrainer:
+    """Minimal trainer shim for fixed opponent policies."""
+
+    def __init__(self, policy):
+        self.policy = policy
+
+    def prep_rollout(self):
+        if hasattr(self.policy, "prep_rollout"):
+            self.policy.prep_rollout()
+
+    def update_from_source(self):
+        # Opponent stays fixed across training iterations.
+        return

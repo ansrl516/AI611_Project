@@ -143,7 +143,7 @@ class Runner:
             exit()
 
         if self.algorithm_name in ["population", "mep", "traj"]:
-            # policy network
+            # policy network (single network for all agents)
             self.policy = Policy(
                 self.all_args,
                 self.envs.observation_space[0],
@@ -157,7 +157,7 @@ class Runner:
 
             # algorithm
             self.trainer = TrainAlgo(self.all_args, self.policy, device=self.device)
-        else:
+        else: # initialize policy per agent according to configs (it holds settings for each agent)
             self.policy = []
             for agent_id in range(self.num_agents):
                 share_observation_space = (
@@ -167,7 +167,7 @@ class Runner:
                 )
                 # policy network
                 if self.algorithm_name in ["e3t"] and agent_id > 0:  # agent0 is the ego agent
-                    po = Policy(
+                    po = Policy( # all ego and partners share same Policy Model
                         self.all_args,
                         self.envs.observation_space[agent_id],
                         share_observation_space,
@@ -176,14 +176,14 @@ class Runner:
                         device=self.device,
                     )
                 else:
-                    po = Policy(
+                    po = Policy( # all partners share same Policy Model
                         self.all_args,
                         self.envs.observation_space[agent_id],
                         share_observation_space,
                         self.envs.action_space[agent_id],
                         device=self.device,
                     )
-                self.policy.append(po)
+                self.policy.append(po) # policy for each partner
 
             # Check if any model_dir is specified (general or agent-specific)
             should_restore = self.model_dir is not None
@@ -198,9 +198,9 @@ class Runner:
             self.trainer = []
             self.buffer = []
             self.trainer_trainable = []
-            for agent_id in range(self.num_agents):
+            for agent_id in range(self.num_agents): # adding trainers
                 # algorithm
-                if self.algorithm_name in ["e3t"]:
+                if self.algorithm_name in ["e3t"]: # add trainer for ego, false trainer for partners
                     if agent_id > 0:
                         tr = TrainAlgo(
                             self.all_args,
@@ -208,7 +208,7 @@ class Runner:
                             self.policy[0],
                             device=self.device,
                         )
-                        self.trainer_trainable.append(False)
+                        self.trainer_trainable.append(False) # trainer for partners is not trainable
                     else:
                         tr = TrainAlgo(
                             self.all_args,
@@ -217,10 +217,10 @@ class Runner:
                             device=self.device,
                         )
                         self.trainer_trainable.append(True)
-                else:
+                else: # add trainable trainer for all agents
                     tr = TrainAlgo(self.all_args, self.policy[agent_id], device=self.device)
                     self.trainer_trainable.append(True)
-                # buffer
+                # buffer for each agent
                 share_observation_space = (
                     self.envs.share_observation_space[agent_id]
                     if self.use_centralized_V

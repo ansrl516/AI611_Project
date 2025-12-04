@@ -140,8 +140,8 @@ class HMARLModel:
         # Dummies: rnn_states, rnn_states_critic, action_log_prob, masks
         """
         Inputs:
-            share_obs: (batch, num_agents, H, W, C_share)
-            obs:       (batch, num_agents, H, W, C)  ← used by actor
+            share_obs: (batch, num_agents, H, W, C_share) <- each num_agents stands for an agent shared observation 
+            obs:       (batch, num_agents, H, W, C) <- each num_agents stands for an agent observation
             rnn_states: (batch, num_agents, rnn_N, hidden)  (unused placeholder)
             rnn_states_critic: (batch, num_agents, rnn_N, hidden)  (unused placeholder)
             masks:      (batch, 1)
@@ -642,6 +642,7 @@ class HMARLModel:
         return actions
 
     def save(self, path):
+        print("saving to", path)
         torch.save(
             {
                 "decoder": self.decoder.state_dict(),
