@@ -22,9 +22,8 @@ from zsceval.runner.separated.overcooked_runner import OvercookedRunner
 from zsceval.algorithms.hierarchical_marl_zsc.hmarl_trainer import HMARLTrainer, HMARLTrainer_PerAgent
 from zsceval.algorithms.hierarchical_marl_zsc.hmarl_policy import HMARLModel
 from zsceval.algorithms.hierarchical_marl_zsc.utils.replay_buffer import Replay_Buffer
-
+from zsceval.algorithms.hierarchical_marl_zsc.hmarl_zsc import EgoTrainer
 from zsceval.utils.log_util import eta, get_table_str
-
 
 def _t2n(x):
     return x.detach().cpu().numpy()
@@ -38,9 +37,9 @@ def _init_fcp_pool(pool_dir: Path):
         )
     if not pool_dir.is_dir():
         raise NotADirectoryError(f"FCP pool path is not a directory: {pool_dir}")
-    
+
     pt_files = sorted([p for p in pool_dir.glob("*.pt") if p.is_file()])
-    return pt_files
+    return pt_files # each directory contains hmarl or mng according to intermediate folder
 
 
 def _sample_fcp_pool(pool_paths, k: int):
@@ -50,6 +49,8 @@ def _sample_fcp_pool(pool_paths, k: int):
     sampled = np.random.choice(pool_paths, size=k, replace=replace)
     return list(sampled)
 
+# We have two types of trainer&policy {fixed HMARLTrainer_PerAgent, trainable EgoTrainer}.  
+# We than add trainable EgoTrainer to the pool. Note that their functions are almost the same
 class OvercookedRunnerHMARL(OvercookedRunner):
     """
     Override some training method, buffers in OvercookedRunner to run HMARLModel, HMARLTrainer.
@@ -115,13 +116,13 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             self.save_dir = self.run_dir / "models"
             self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Fetching Pooling partners for FCP training 
+        # 추가: Fetching Pooling partners for FCP training 
         # folder format: manually store hmarl_train_config.pkl hyperparameter file + model_xxx.pt files in a directory policy_configs and point to this directory
         # ex. zsceval/hierarchical_marl_zsc/fcp_pooling/trial1 -> {hmarl{xx.pkl, ...}, mng{...}}
         # sh format: add --fcp_pool_dir /path_to_fcp_pooling_directory (ex. zsceval/hierarchical_marl_zsc/fcp_pooling/trial1)
         if not hasattr(self.all_args, "fcp_pool_dir") or self.all_args.fcp_pool_dir is None:
             raise ValueError("You must explicitly provide --fcp_pool_dir pointing to your FCP policy directory.")
-        self.fcp_pool_dir = Path(self.all_args.fcp_pool_dir + "hmarl")
+        self.fcp_pool_dir = Path(self.all_args.fcp_pool_dir)
         self.fcp_pool = _init_fcp_pool(self.fcp_pool_dir) # load all .pt paths in the directory
         self.fcp_partner_ids = []
         self.fcp_pool_add_step_threshold = getattr(
@@ -130,13 +131,13 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         self.fcp_pool_min_eval_sparse = getattr(self.all_args, "fcp_pool_min_eval_sparse", -np.inf) # minimum eval reward condition to add agent0 to pool
         self.last_eval_sparse = None # used for logging
 
-        # load HMARL shared hyperparameter from specific config directory
-        trainer_cfg_path = self.all_args.hmarl_trainer_config_path 
+        # load HMARL and mng shared hyperparameter from specific config directory
+        trainer_cfg_path = self.all_args.trainer_config_path # path to hmarl_mng_hmarl_config.pkl
         cfg_namespace = {}
         with open(trainer_cfg_path, "r") as f:
             exec(f.read(), cfg_namespace)
         trainer_cfg = cfg_namespace["config"]["trainer"]
-        model_cfg = cfg_namespace["config"]["model"]  # trainer config includes model config inside
+        model_cfg = cfg_namespace["config"]["model_"]  # 추가: trainer config includes hmarl and mng model config inside
 
         # =====================================================================
         # Override some parts of the PKL configs according to runtime all_args
@@ -173,23 +174,37 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         trainer_cfg["steps_per_assign"] = model_cfg["steps_per_assign"]
         
 
-        # Create instance of algorithm per agent (same config, separate parameters)
-        TrainAlgo, Policy = HMARLTrainer_PerAgent, HMARLModel
-        combined_cfg = {"trainer": trainer_cfg, "model": model_cfg}
-        self.trainer = []
-        self.policy = []
+        # Create instance of algorithm per agent (same config, separate parameters for hmarl and mng each)
+        fixed_trainer_cls, ego_trainer_cls = HMARLTrainer_PerAgent, EgoTrainer
+        combined_cfg_hmarl = {"trainer": trainer_cfg, "model": model_cfg}
+        combined_cfg_mng = {"trainer": trainer_cfg, "model": model_cfg}
 
-        for _ in range(self.num_agents):
-            cfg_copy = copy.deepcopy(combined_cfg)
-            trainer = TrainAlgo(cfg_copy, self.device)
-            self.trainer.append(trainer)
-            self.policy.append(trainer.hsd)
+        requested_trainable = getattr(self.all_args, "trainable_agent_ids", [0])
+        self.trainable_agent_ids = [i for i in requested_trainable if 0 <= i < self.num_agents]
+        if not self.trainable_agent_ids:
+            self.trainable_agent_ids = [0]
+        self.fixed_agent_ids = [i for i in range(self.num_agents) if i not in self.trainable_agent_ids]
+
+        self.trainer = [None for _ in range(self.num_agents)]
+        self.policy = [None for _ in range(self.num_agents)]
+
+        for agent_id in self.trainable_agent_ids: # mng trainer for trainable ego agents
+            cfg_copy = copy.deepcopy(combined_cfg_mng)
+            trainer = ego_trainer_cls(cfg_copy, self.device)
+            self.trainer[agent_id] = trainer
+            self.policy[agent_id] = trainer.hsd
+
+        for agent_id in self.fixed_agent_ids: # fixed hmarl trainer for fixed fcp partners
+            cfg_copy = copy.deepcopy(combined_cfg_hmarl)
+            trainer = fixed_trainer_cls(cfg_copy, self.device)
+            self.trainer[agent_id] = trainer
+            self.policy[agent_id] = trainer.hsd
 
         # dump policy config to allow loading population in yaml form
-        self.policy_config = copy.deepcopy(model_cfg)
-        policy_config_path = os.path.join(self.run_dir, "policy_config.pkl")
-        pickle.dump(self.policy_config, open(policy_config_path, "wb"))
-        print(f"Pickle dump policy config at {policy_config_path}")
+        # self.policy_config = copy.deepcopy(model_cfg)
+        # policy_config_path = os.path.join(self.run_dir, "policy_config.pkl")
+        # pickle.dump(self.policy_config, open(policy_config_path, "wb"))
+        # print(f"Pickle dump policy config at {policy_config_path}")
         
         # not implemented?
         if "store" in self.experiment_name:
@@ -205,18 +220,18 @@ class OvercookedRunnerHMARL(OvercookedRunner):
 
     def _load_fcp_partners(self):
         self.fcp_partner_ids = []
-        num_partners = max(0, min(self.num_agents - 1, len(self.trainer) - 1))
-        sampled_paths = _sample_fcp_pool(self.fcp_pool, num_partners) # self.fcp_pool: list of Path objects of .pt files, sample num_partners paths
-        if not sampled_paths: # raise error
-            raise ValueError("FCP partner sampling failed: no partners sampled.")
-        for idx, model_path in enumerate(sampled_paths, start=1): # 0 stands for trainable ego
-            self.trainer[idx].hsd.load(str(model_path), map_location=self.device)
-            self.policy[idx] = self.trainer[idx].hsd
-            self.fcp_partner_ids.append(idx) # store which agent ids are fcp partners (actually, all except agent0)
+        fixed_ids = list(self.fixed_agent_ids)
+        sampled_paths = _sample_fcp_pool(self.fcp_pool, len(fixed_ids))
+        if not sampled_paths:
+            return
+        for agent_id, model_path in zip(fixed_ids, sampled_paths):
+            self.trainer[agent_id].hsd.load(str(model_path), map_location=self.device)
+            self.policy[agent_id] = self.trainer[agent_id].hsd
+            self.fcp_partner_ids.append(agent_id)
 
     def _append_agent0_to_pool(self, total_num_steps: int):
-        if not self.trainer: # raise error
-            raise ValueError("Trainer list is empty, cannot append agent0 to pool.")
+        if not self.trainer:
+            return
         if total_num_steps < self.fcp_pool_add_step_threshold:
             logger.info(
                 f"[FCP pool] skip append: total steps {total_num_steps} < threshold {self.fcp_pool_add_step_threshold}"
@@ -230,13 +245,14 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 )
                 return
         timestamp = int(time.time() * 1000)
-        save_path = self.fcp_pool_dir / f"pool_agent0_{timestamp}.pt" # path to save agent0's current policy
-        self.trainer[0].hsd.save(str(save_path))
+        ego_id = self.trainable_agent_ids[0] if self.trainable_agent_ids else 0
+        save_path = self.fcp_pool_dir / f"pool_agent{ego_id}_{timestamp}.pt"
+        self.trainer[ego_id].hsd.save(str(save_path))
         self.fcp_pool.append(save_path)
 
-    def run(self): # uploads nontrainable trainer&policies to agent index 1 ~ num_agent-1 
-        # train sp
-        self._load_fcp_partners() # load fcp partners into trainer[1~]
+    # single step of training ego and uploading it to pool
+    def run_stage(self): # uploads nontrainable trainer&policies to agent index 1 ~ num_agent-1 
+        self._load_fcp_partners() # 2type: mng + hmarl
         obs, share_obs, available_actions = self.warmup() # changed from original warmup
 
         start = time.time()
@@ -454,7 +470,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             # trainer internally includes policy, and updates buffers, current skills, intrinsic rewards, ... internally
             # so it only prints out actions, actual training algorithm of hmarl is hidden
             agent_actions = trainer.get_actions_algorithm(step, obs, share_obs, available_actions)
-            agent_actions = np.asarray(agent_actions) # [n_rollout_threads, 1, 1]
+            agent_actions = np.asarray(agent_actions) # [n_rollout_threads, 1, 1] 
             agent_actions = agent_actions.squeeze(1) # remove the agent dimension
             actions_by_agent.append(agent_actions)
 
@@ -464,7 +480,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
     def insert(self, data): # override to fit HMARLTrainer
         step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones = data
 
-        for agent_id, trainer in enumerate(self.trainer): 
+        for agent_id, trainer in enumerate(self.trainer):
             trainer.update_buffer(
                 step,
                 obs[:,agent_id], # [n_rollout_threads, H, W, C]
@@ -502,7 +518,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
     def train(self, num_steps: int = 0):
         all_train_infos = {}
         for agent_id, trainer in enumerate(self.trainer):
-            if agent_id in self.fcp_partner_ids:
+            if agent_id in self.fixed_agent_ids or agent_id in self.fcp_partner_ids:
                 continue
             trainer.prep_training()
             train_info = trainer.training_step(num_steps)

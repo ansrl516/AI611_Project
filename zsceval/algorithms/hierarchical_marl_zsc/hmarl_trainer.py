@@ -443,6 +443,8 @@ class HMARLTrainer(OvercookedRunner):
         actions = np.expand_dims(actions, axis=-1)  # shape: (..., num_agents, 1)
         return actions
 
+
+# Single-Agent Wrapper around HMARLTrainer
 class HMARLTrainer_PerAgent(HMARLTrainer):
     """
     Single-agent wrapper around HMARLTrainer.
@@ -456,7 +458,7 @@ class HMARLTrainer_PerAgent(HMARLTrainer):
         super().__init__(cfg_single, device=device)
 
     @torch.no_grad()
-    def get_actions_algorithm(self, steps, obs, share_obs, available_actions):
+    def get_actions_algorithm(self, steps, obs, share_obs, available_actions): 
         obs_exp = np.expand_dims(obs, axis=1)
         share_exp = np.expand_dims(share_obs, axis=1) if share_obs is not None else None
         avail_exp = np.expand_dims(available_actions, axis=1)
