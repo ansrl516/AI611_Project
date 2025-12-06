@@ -21,6 +21,7 @@ from zsceval.envs.env_wrappers import ShareDummyVecEnv, ShareSubprocDummyBatchVe
 from zsceval.envs.overcooked_new.Overcooked_Env import Overcooked as Overcooked_new
 from zsceval.overcooked_config import get_overcooked_args
 from zsceval.utils.train_util import get_base_run_dir, setup_seed
+import numpy as np
 
 os.environ["WANDB_DIR"] = os.getcwd() + "/wandb/"
 os.environ["WANDB_CACHE_DIR"] = os.getcwd() + "/wandb/.cache/"
@@ -79,14 +80,11 @@ def parse_args(args, parser: argparse.ArgumentParser):
         action="store_true",
         help="While existing other agent like planning or human model, use an index to fix the main RL-policy agent.",
     )
-
+    # 추가: fcp 관련된 shell 인자들
     parser.add_argument("--use_task_v_out", default=False, action="store_true")
-    parser.add_argument(
-        "--hmarl_trainer_config_path",
-        type=str,
-        default="zsceval/algorithms/hierarchical_marl_zsc/configs/hmarl_trainer_config.pkl",
-        help="Path to HMARL trainer config pickle.",
-    )
+    parser.add_argument("--fcp_pool_dir", type=str, default=None, help="Path to pre-trained FCP pool directory.")
+    parser.add_argument("--fcp_pool_add_step_threshold", type=int, default=50, help="Minimum epochs between adding new agents to FCP pool.")
+    parser.add_argument("--fcp_pool_min_eval_sparse", type=float, default=-np.inf, help="Minimum eval reward condition to add agent0 to pool.")
     # all_args = parser.parse_known_args(args)[0]
     all_args = parser.parse_args(args)
     from zsceval.overcooked_config import OLD_LAYOUTS

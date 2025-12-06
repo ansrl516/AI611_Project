@@ -1,30 +1,30 @@
-# Manager ego policy를 hmarl를 통해 훈련한 seed pool를 랜덤으로 가져와서 훈련 TODO (참고: train_mep.py)
-# 다시 생각해보니 그냥 ego를 훈련시키는 것이므로 self play에서 확장하는게 나을 듯?
+
+# Train HMARL_Trainer which wraps HMARLModel
+# We use separate training scheme here because its training schema is completely different from other algorithms
+
 #!/usr/bin/env python
+import argparse
 import os
+os.chdir("/workspace") # Set working directory to the project root
+import pprint
 import socket
 import sys
-from argparse import Namespace
 from pathlib import Path
-from pprint import pprint
 
 import setproctitle
 import torch
 import wandb
-import yaml
 from loguru import logger
 
 from zsceval.config import get_config
-from zsceval.envs.env_wrappers import (
-    ChooseDummyVecEnv,
-    ShareDummyVecEnv,
-    ShareSubprocDummyBatchVecEnv,
-)
-from zsceval.envs.overcooked.Overcooked_Env import Overcooked
+from zsceval.envs.env_wrappers import ShareDummyVecEnv, ShareSubprocDummyBatchVecEnv
 from zsceval.envs.overcooked_new.Overcooked_Env import Overcooked as Overcooked_new
-from zsceval.envs.wrappers.env_policy import PartialPolicyEnv
 from zsceval.overcooked_config import get_overcooked_args
 from zsceval.utils.train_util import get_base_run_dir, setup_seed
+
+os.environ["WANDB_DIR"] = os.getcwd() + "/wandb/"
+os.environ["WANDB_CACHE_DIR"] = os.getcwd() + "/wandb/.cache/"
+os.environ["WANDB_CONFIG_DIR"] = os.getcwd() + "/wandb/.config/"
 
 
 def make_train_env(all_args, run_dir): # 경윤님 수정 예정
@@ -62,21 +62,17 @@ def make_eval_env(all_args, run_dir):
 
         return init_env
 
-    # BUG: should be share
     if all_args.n_eval_rollout_threads == 1:
-        return ChooseDummyVecEnv([get_env_fn(0)])
+        return ShareDummyVecEnv([get_env_fn(0)])
     else:
-        # return ChooseSubprocVecEnv(
-        #     [get_env_fn(i) for i in range(all_args.n_eval_rollout_threads)]
-        # )
         return ShareSubprocDummyBatchVecEnv(
             [get_env_fn(i) for i in range(all_args.n_eval_rollout_threads)],
             all_args.dummy_batch_size,
         )
 
 
-def parse_args(args, parser):
-    parser = get_overcooked_args(parser) # includes use_hsp
+def parse_args(args, parser: argparse.ArgumentParser):
+    parser = get_overcooked_args(parser)
     parser.add_argument(
         "--use_phi",
         default=False,
@@ -84,82 +80,12 @@ def parse_args(args, parser):
         help="While existing other agent like planning or human model, use an index to fix the main RL-policy agent.",
     )
 
-    parser.add_argument("--shaped_info_coef", default=0.5, type=float)
-    parser.add_argument("--policy_group_normalization", default=False, action="store_true")
-    parser.add_argument("--use_advantage_prioritized_sampling", default=False, action="store_true")
-    parser.add_argument("--uniform_preference", default=False, action="store_true")
-    parser.add_argument("--uniform_sampling_repeat", default=0, type=int)
     parser.add_argument("--use_task_v_out", default=False, action="store_true")
-    # population
-    parser.add_argument(
-        "--population_yaml_path",
-        type=str,
-        help="Path to yaml file that stores the population info.",
-    )
-    # mep
-    parser.add_argument(
-        "--stage",
-        type=int,
-        default=1,
-        help="Stages of MEP training. 1 for Maximum-Entropy PBT. 2 for FCP-like training.",
-    )
-    parser.add_argument(
-        "--mep_use_prioritized_sampling",
-        default=False,
-        action="store_true",
-        help="Use prioritized sampling in MEP stage 2.",
-    )
-    parser.add_argument(
-        "--mep_prioritized_alpha",
-        type=float,
-        default=3.0,
-        help="Alpha used in softing prioritized sampling probability.",
-    )
-    parser.add_argument(
-        "--mep_entropy_alpha",
-        type=float,
-        default=0.01,
-        help="Weight for population entropy reward. MEP uses 0.01 in general except 0.04 for Forced Coordination",
-    )
-    # population
-    parser.add_argument(
-        "--population_size",
-        type=int,
-        default=5,
-        help="Population size involved in training.",
-    )
-    parser.add_argument(
-        "--adaptive_agent_name",
-        type=str,
-        required=True,
-        help="Name of training policy at Stage 2.",
-    )
-
-    # train and eval batching
-    parser.add_argument(
-        "--train_env_batch",
-        type=int,
-        default=1,
-        help="Number of parallel threads a policy holds",
-    )
-    parser.add_argument(
-        "--eval_env_batch",
-        type=int,
-        default=1,
-        help="Number of parallel threads a policy holds",
-    )
-
-    # fixed policy actions inside env threads
-    parser.add_argument(
-        "--use_policy_in_env",
-        default=True,
-        action="store_false",
-        help="Use loaded policy to move in env threads.",
-    )
-
-    # eval with fixed policy
-    parser.add_argument("--eval_policy", default="", type=str)
-
+    # 추가: fcp mng 관련된 shell 인자들
+    parser.add_argument("--use_task_v_out", default=False, action="store_true")
+    parser.add_argument("--fcp_pool_dir", type=str, default="zsceval/algorithms/hierarchical_marl_zsc/fcp_pooling/asymmetric_advantages_trial1", help="Path to pre-trained FCP pool directory.")
+    parser.add_argument("--fcp_pool_add_step_threshold", type=int, default=50, help="Minimum epochs between adding new agents to FCP pool.")
+    parser.add_argument("--fcp_pool_min_eval_sparse", type=float, default=-np.inf, help="Minimum eval reward condition to add agent0 to pool.")
     # all_args = parser.parse_known_args(args)[0]
     all_args = parser.parse_args(args)
     from zsceval.overcooked_config import OLD_LAYOUTS
@@ -175,14 +101,8 @@ def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
 
-    if all_args.algorithm_name == "rmappo":
-        assert all_args.use_recurrent_policy or all_args.use_naive_recurrent_policy, "check recurrent policy!"
-    elif all_args.algorithm_name == "mappo":
-        assert (
-            all_args.use_recurrent_policy == False and all_args.use_naive_recurrent_policy == False
-        ), "check recurrent policy!"
-    else:
-        raise NotImplementedError
+    assert all_args.algorithm_name == "hmarl", "Only HMARL is supported in train_hmarl.py!"
+    all_args.share_policy = False  
 
     # cuda
     if all_args.cuda and torch.cuda.is_available():
@@ -208,11 +128,9 @@ def main(args):
     all_args.run_dir = run_dir
 
     # wandb
-    if all_args.overcooked_version == "new":
-        project_name = all_args.env_name + "-new"
-    else:
-        project_name = all_args.env_name
+    project_name = all_args.env_name + "-new"  # Always use overcooked_new
     if all_args.use_wandb:
+        print("Initialize wandb...")
         run = wandb.init(
             config=all_args,
             project=project_name,
@@ -260,7 +178,7 @@ def main(args):
     # np.random.seed(all_args.seed)
     setup_seed(all_args.seed)
 
-    # env init
+    # create env_instances
     envs = make_train_env(all_args, run_dir)
     eval_envs = make_eval_env(all_args, run_dir) if all_args.use_eval else None
     num_agents = all_args.num_agents
@@ -275,22 +193,21 @@ def main(args):
         "run_dir": run_dir,
     }
 
-    # run experiments
-    from zsceval.runner.separated.overcooked_runner_hmarl_fcp_with_mng import OvercookedRunnerHMARL as Runner
-
+    # run experiments with hmarl using our custom runner
+    from zsceval.runner.separated.overcooked_runner_hmarl_fcp_with_mng import OvercookedRunnerMNG as Runner
     runner = Runner(config)
     runner.run()
+    envs.close()
 
     # post process
-    envs.close()
     if all_args.use_eval and eval_envs is not envs:
         eval_envs.close()
-
-    if all_args.use_wandb:
-        run.finish(quiet=True)
+        if all_args.use_wandb:
+            run.finish(quiet=True)
     else:
-        runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
-        runner.writter.close()
+        if not all_args.use_wandb and hasattr(runner, "writter"):
+            runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
+            runner.writter.close() 
 
 
 if __name__ == "__main__":

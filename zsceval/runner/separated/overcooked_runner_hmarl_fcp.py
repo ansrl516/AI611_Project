@@ -39,7 +39,7 @@ def _init_fcp_pool(pool_dir: Path):
     if not pool_dir.is_dir():
         raise NotADirectoryError(f"FCP pool path is not a directory: {pool_dir}")
     
-    pt_files = sorted([p for p in pool_dir.glob("*.pt") if p.is_file()])
+    pt_files = sorted([p for p in pool_dir.rglob("*.pt") if p.is_file()])
     return pt_files
 
 
@@ -115,13 +115,13 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             self.save_dir = self.run_dir / "models"
             self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Fetching Pooling partners for FCP training 
+        # 추가: Fetching Pooling partners for FCP training 
         # folder format: manually store hmarl_train_config.pkl hyperparameter file + model_xxx.pt files in a directory policy_configs and point to this directory
         # ex. zsceval/hierarchical_marl_zsc/fcp_pooling/trial1 -> {hmarl{xx.pkl, ...}, mng{...}}
         # sh format: add --fcp_pool_dir /path_to_fcp_pooling_directory (ex. zsceval/hierarchical_marl_zsc/fcp_pooling/trial1)
         if not hasattr(self.all_args, "fcp_pool_dir") or self.all_args.fcp_pool_dir is None:
             raise ValueError("You must explicitly provide --fcp_pool_dir pointing to your FCP policy directory.")
-        self.fcp_pool_dir = Path(self.all_args.fcp_pool_dir + "hmarl")
+        self.fcp_pool_dir = Path(self.all_args.fcp_pool_dir)
         self.fcp_pool = _init_fcp_pool(self.fcp_pool_dir) # load all .pt paths in the directory
         self.fcp_partner_ids = []
         self.fcp_pool_add_step_threshold = getattr(
@@ -130,11 +130,13 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         self.fcp_pool_min_eval_sparse = getattr(self.all_args, "fcp_pool_min_eval_sparse", -np.inf) # minimum eval reward condition to add agent0 to pool
         self.last_eval_sparse = None # used for logging
 
-        # load HMARL shared hyperparameter from specific config directory
-        trainer_cfg_path = self.all_args.hmarl_trainer_config_path 
+        # load HMARL shared hyperparameter from specific config.pkl inside fcp_pool_dir
+        trainer_cfg_path = self.fcp_pool_dir / "hmarl/hmarl_trainer_config.pkl"
         cfg_namespace = {}
         with open(trainer_cfg_path, "r") as f:
             exec(f.read(), cfg_namespace)
+
+
         trainer_cfg = cfg_namespace["config"]["trainer"]
         model_cfg = cfg_namespace["config"]["model"]  # trainer config includes model config inside
 
@@ -230,9 +232,19 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 )
                 return
         timestamp = int(time.time() * 1000)
-        save_path = self.fcp_pool_dir / f"pool_agent0_{timestamp}.pt" # path to save agent0's current policy
+        save_path = self.fcp_pool_dir / f"hmarl/policy_configs/pool_agent0_{timestamp}.pt" # path to save agent0's current policy
         self.trainer[0].hsd.save(str(save_path))
         self.fcp_pool.append(save_path)
+
+        # change seed to avoid repeatedly adding same policy
+        new_seed = np.random.randint(0, 100000)
+        np.random.seed(new_seed)
+        torch.manual_seed(new_seed)
+
+        # reset trainer and policy for agent 0
+        cfg_copy = copy.deepcopy(self.trainer[0].config)
+        self.trainer[0] = HMARLTrainer(cfg_copy, self.device)
+        self.policy[0] = self.trainer[0].hsd
 
     def run(self): # uploads nontrainable trainer&policies to agent index 1 ~ num_agent-1 
         # train sp
@@ -287,19 +299,19 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             s_time = time.time()
             total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads
             
-            # save model (overriden because HMARL has multiple networks than rMAPPO, ...)
-            if episode < 50:
-                if episode % 2 == 0:
-                    # self.save(episode)
-                    self.save(total_num_steps)
-            elif episode < 100:
-                if episode % 5 == 0:
-                    self.save(total_num_steps)
-                    # self.save(episode)
-            else:
-                if episode % self.save_interval == 0 or episode == episodes - 1:
-                    self.save(total_num_steps)
-                    # self.save(episode)
+            # # save model (overriden because HMARL has multiple networks than rMAPPO, ...)
+            # if episode < 50:
+            #     if episode % 2 == 0:
+            #         # self.save(episode)
+            #         self.save(total_num_steps)
+            # elif episode < 100:
+            #     if episode % 5 == 0:
+            #         self.save(total_num_steps)
+            #         # self.save(episode)
+            # else:
+            #     if episode % self.save_interval == 0 or episode == episodes - 1:
+            #         self.save(total_num_steps)
+            #         # self.save(episode)
             
             print("episode training finished: ", episode)
             # log information
@@ -511,10 +523,10 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         print("train_infos in overcooked_runner_hmarl:", all_train_infos)
         return all_train_infos # return dict, not list
     
-    def save(self, step): # override to store all networks of HMARL (TODO)
+    def save(self, step): # saved when pushing to policy pool
         for agent_id, trainer in enumerate(self.trainer):
             agent_save_dir = Path(self.save_dir) / f"agent{agent_id}"
-            trainer.save(step, str(agent_save_dir))
+            trainer.save(step, str(agent_save_dir)) # saved to policy pool folder
 
     # change eval to fit HMARLTrainer
     @torch.no_grad()
