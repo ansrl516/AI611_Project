@@ -523,7 +523,7 @@ class OvercookedRunnerMNG(OvercookedRunner):
                     share_obs_next[:,agent_id], # [n_rollout_threads, H, W, C_share]
                     dones[:,agent_id], # [n_rollout_threads, 1]
                 )
-            else:
+            else: # API: mng class's buffer
                 trainer.update_buffer(
                     step,
                     obs[:,agent_id], # [n_rollout_threads, H, W, C]
