@@ -385,7 +385,42 @@ class ManagerTrainerSingle:
         return feat
 
     def _estimate_partner_skill(self) -> torch.Tensor:
+        """
+        Estimate partner skill distribution using the pretrained decoder.
+        This treats partners as all agents except ego and pools their per-skill probs.
+        """
         if not self._traj_buffer:
             batch = getattr(self, "period_reward", np.zeros((1,), dtype=np.float32)).shape[0]
             return torch.zeros(batch, self.num_skills, device=self.device)
-        return torch.zeros(self._traj_buffer[0].shape[0], self.num_skills, device=self.device)
+
+        # _traj_buffer: list length T of shared_obs (B, H, W, C_share).
+        # We do not have per-partner obs here, so we approximate using shared_obs and pool.
+        traj_np = np.stack(self._traj_buffer, axis=0)  # (T, B, H, W, C_share)
+        traj_np = np.transpose(traj_np, (1, 0, 2, 3, 4))  # (B, T, H, W, C_share)
+        B, T, H, W, C = traj_np.shape
+
+        # Decoder expects (B*, T, H, W, C_obs); here we reuse shared obs channels.
+        traj_flat = traj_np.reshape(B * 1, T, H, W, C)
+        traj_t = torch.as_tensor(traj_flat, dtype=torch.float32, device=self.device)
+
+        # Downsample and run decoder to get logits; mirror hmarl_policy Decoder usage.
+        with torch.no_grad():
+            # Encode frames
+            Bflat, Tflat, _, _, _ = traj_t.shape
+            traj_frames = traj_t.reshape(Bflat * Tflat, H, W, C)
+            obs_encoded = self.hsd.obs_encoder(traj_frames)  # (Bflat*Tflat, obs_dim)
+            obs_seq = obs_encoded.reshape(Bflat, Tflat, -1)
+
+            # Downsample trajectory as in _downsample_traj
+            down = obs_seq[:, :: self.hsd.traj_skip, :]
+            if self.hsd.obs_truncate_length:
+                down = down[:, :, : self.hsd.obs_truncate_length]
+            if self.hsd.use_state_difference:
+                down = down[:, 1:, :] - down[:, :-1, :]
+
+            logits, probs = self.hsd.decoder(down)  # (Bflat, num_skills)
+
+        probs = probs.reshape(B, 1, self.num_skills)  # treat as one "partner" stream
+        # Pool over partners (mean) to get (B, num_skills)
+        pooled = probs.mean(dim=1)
+        return pooled
