@@ -287,8 +287,9 @@ class HMARLTrainer(OvercookedRunner):
         # 9) End of one skill period? -> push high-level transition
         # ---------------------------------------------------
         is_end_of_skill = (steps + 1) % self.steps_per_assign == 0 and steps != 0
+        flush_high_level = is_end_of_skill or np.any(dones_env > 0.5)
 
-        if is_end_of_skill:
+        if flush_high_level:
             # Cache aggregated reward for logging before it gets reset
             self.episode_high_level_rewards.append(float(np.mean(self.rewards_high)))
 
@@ -305,17 +306,24 @@ class HMARLTrainer(OvercookedRunner):
                 ]
             )
 
-            # Append trajectories to decoder dataset
+            # Append trajectories to decoder dataset (train_decoder pads if needed)
             for b in range(self.batch_size):
                 for ag in range(self.num_agents):
-                    traj_slice = np.array(
-                        self.traj_per_agent[b][ag]
-                    )  # length == steps_per_assign
+                    traj_slice = np.array(self.traj_per_agent[b][ag])
                     skill_id = self.current_skills[b][ag]
                     self.dataset.append([traj_slice, skill_id])
 
-            # Reset only rewards_high
-            self.rewards_high = np.zeros_like(self.rewards_high, dtype=np.float32)
+            # Reset cumulative rewards; if only some envs ended, keep others accumulating
+            if is_end_of_skill:
+                self.rewards_high = np.zeros_like(self.rewards_high, dtype=np.float32)
+            else:
+                done_mask = dones_env > 0.5
+                self.rewards_high[done_mask] = 0.0
+                # Clear trajectories for finished envs to avoid bleeding across episodes
+                for b, done_flag in enumerate(done_mask):
+                    if done_flag:
+                        for ag in range(self.num_agents):
+                            self.traj_per_agent[b][ag].clear()
 
         # ---------------------------------------------------
         # 10) Advance global step counter

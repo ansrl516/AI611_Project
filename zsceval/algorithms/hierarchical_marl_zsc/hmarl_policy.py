@@ -242,7 +242,7 @@ class HMARLModel:
         """Wraps get_actions_low and assign_skills with internal variables, implements HMARL logic."""
         # 1. Assign skills at the beginning and every steps_per_assign
         if steps % self.steps_per_assign == 0:
-            self.current_skills = self.assign_skills(shared_obs, epsilon=epsilon)  # [B, N]
+            self.current_skills = self.assign_skills(obs=obs, share_obs=shared_obs, epsilon=epsilon)  # [B, N]
 
         # 2. Get low-level actions using current skills
         actions = self.get_actions_low(obs, available_actions, self.current_skills)  # [B, N]
@@ -285,34 +285,30 @@ class HMARLModel:
 
         return actions.cpu().numpy()
 
-    def assign_skills(self, share_obs, epsilon=None):
+    def assign_skills(self, obs, share_obs=None, epsilon=None):
         """
         Assign skills to agents via high-level Q-network.
         Args:
-            share_obs: np array of shape [B, N, H, W, C_share]
+            obs: np array of shape [B, N, H, W, C]
+            share_obs: optional np array of shape [B, N, H, W, C_share]
             epsilon: exploration rate (float or None)
         Returns:
             skills: np array of shape [B, N]
         """
 
-        B = share_obs.shape[0]
+        B = obs.shape[0]
         N = self.num_agents
 
         if epsilon is None:
             epsilon = 0.0
 
-        share_obs_t = torch.as_tensor(
-            share_obs, dtype=torch.float32, device=self.device
-        )  # (B, N, H, W, C_share)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)  # (B, N, H, W, C)
 
-        # encode shared observations to "state" representation
-        state_encoded = self.share_obs_encoder(share_obs_t)  # (B, N, state_dim)
+        # Per-agent utilities use local observation encoding (matches training).
+        obs_encoded = self.obs_encoder(obs_t)  # (B, N, obs_dim)
 
-        # per-agent utilities from local obs: we approximate by reusing the
-        # shared encoding; the important part is: agent_main gets a per-agent
-        # embedding, mixer gets state_encoded.
         with torch.no_grad():
-            q_values = self.agent_main(state_encoded)  # (B, N, K)
+            q_values = self.agent_main(obs_encoded)  # (B, N, K)
             greedy_skills = torch.argmax(q_values, dim=2).cpu().numpy()  # (B, N)
 
         # epsilon-greedy per agent
@@ -676,8 +672,9 @@ class HMARLModel:
         with torch.no_grad():
             _, decoder_probs = self.decoder(traj_down)  # (B, num_skills)
             prob = decoder_probs[torch.arange(B), skills_t]  # (B,)
-
+        
         return prob.cpu().numpy()
+        # return np.zeros_like(prob.cpu().numpy()) # return zero
 
     @torch.no_grad()
     def reset(self):
