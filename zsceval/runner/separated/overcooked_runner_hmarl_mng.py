@@ -8,16 +8,40 @@ from icecream import ic
 from loguru import logger
 
 from zsceval.runner.separated.base_runner import Runner
+from zsceval.runner.separated.overcooked_runner import OvercookedRunner
 from zsceval.utils.log_util import eta
 
 
 def _t2n(x):
     return x.detach().cpu().numpy()
 
-
-class OvercookedRunner(Runner):
+# can you change current buffer to using 
+class OvercookedRunner_mng(OvercookedRunner):
     def __init__(self, config):
         super().__init__(config)
+
+        class FrozenTrainer:
+            """Minimal trainer shim for fixed opponent policies."""
+
+            def __init__(self, policy):
+                self.policy = policy
+
+            def prep_rollout(self):
+                if hasattr(self.policy, "prep_rollout"):
+                    self.policy.prep_rollout()
+
+            def update_from_source(self):
+                # Opponent stays fixed across training iterations.
+                return
+
+        ego_id = getattr(self.all_args, "ego_id", 0)
+        for agent_id in range(self.num_agents):
+            if agent_id == ego_id:
+                continue
+            # Opponent policies are fixed, so replace their trainers with no-op shims and
+            # mark them non-trainable.
+            self.trainer[agent_id] = FrozenTrainer(self.policy[agent_id])
+            self.trainer_trainable[agent_id] = False
 
     def run(self):
         self.warmup()
@@ -30,7 +54,7 @@ class OvercookedRunner(Runner):
             time.time()
             if self.use_linear_lr_decay:
                 for agent_id in range(self.num_agents):
-                    self.trainer[agent_id].policy.lr_decay(episode, episodes)
+                    self.trainer[agent_id].policy.lr_decay(episode, episodes) 
 
             for step in range(self.episode_length):
                 # Sample actions
@@ -230,6 +254,10 @@ class OvercookedRunner(Runner):
             rnn_states,
             rnn_states_critic,
         ) = data
+
+        # TODO: try to change shape of obs, share_obs, rewards
+        #       as overcooked_runner_hmarl's self.info_translation (infos)
+        #       because it may not work with current buffer settings
 
         rnn_states[dones == True] = np.zeros(
             ((dones == True).sum(), self.recurrent_N, self.hidden_size),

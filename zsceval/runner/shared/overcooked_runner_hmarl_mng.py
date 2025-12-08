@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from zsceval.runner.shared.base_runner import *
 from zsceval.runner.separated.overcooked_runner import OvercookedRunner
-from zsceval.algorithms.hierarchical_marl_zsc.hmarl_trainer import HMARLTrainer
+from zsceval.algorithms.hierarchical_marl_zsc.hmarl_trainer_mng import ManagerTrainerSingle as HMARLTrainer
 from zsceval.algorithms.hierarchical_marl_zsc.hmarl_policy import HMARLModel
 from zsceval.algorithms.hierarchical_marl_zsc.utils.replay_buffer import Replay_Buffer
 
@@ -29,12 +29,12 @@ def _t2n(x):
     return x.detach().cpu().numpy()
 
 
-class OvercookedRunnerHMARL(OvercookedRunner):
+class OvercookedRunnerHMARL_mng(OvercookedRunner):
     """
-    Override some training method, buffers in OvercookedRunner to run HMARLModel, HMARLTrainer.
+    Same as OvercookedRunnerHMARL, but uses manager-based trainer (hmarl_trainer_mng.py).
     """
-    # override init method
-    def __init__(self, config): 
+
+    def __init__(self, config):
         self.all_args = config["all_args"]
         self.envs = config["envs"]
         self.eval_envs = config["eval_envs"]
@@ -72,7 +72,6 @@ class OvercookedRunnerHMARL(OvercookedRunner):
 
         # logging settings
         if self.use_render:
-            # config["run_dir"] 는 Path 라고 가정
             self.run_dir = config["run_dir"]
             self.gif_dir = self.run_dir / "gifs"
             self.gif_dir.mkdir(parents=True, exist_ok=True)
@@ -81,7 +80,6 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             self.save_dir.mkdir(parents=True, exist_ok=True)
 
         if self.use_wandb:
-            # wandb.run.dir 은 문자열이므로 Path 로 감싸줌
             self.run_dir = Path(wandb.run.dir)
             self.save_dir = self.run_dir
         else:
@@ -94,24 +92,16 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             self.save_dir = self.run_dir / "models"
             self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        # 나머지 코드에서 쓸 때는:
-        # str(self.run_dir), str(self.save_dir) 로 필요할 때만 문자열 변환
-        # load HMARL specific parameters from specific config directory
+        # load HMARL specific parameters from config file
         trainer_cfg_path = self.all_args.hmarl_trainer_config_path
         cfg_namespace = {}
         with open(trainer_cfg_path, "r") as f:
             exec(f.read(), cfg_namespace)
         trainer_cfg = cfg_namespace["config"]["trainer"]
-        model_cfg = cfg_namespace["config"]["model"]  # trainer config includes model config inside
+        model_cfg = cfg_namespace["config"]["model"]
 
-        # =====================================================================
-        # Override some parts of the PKL configs according to runtime all_args
-        # =====================================================================
-        # -----------------------
-        # Override model config
-        # -----------------------
+        # Override model config with env-provided shapes
         model_cfg["num_agents"] = self.num_agents
-        # The actual observation/ shared observation/ action spaces come from env
         model_cfg["obs_space"] = self.envs.observation_space
         model_cfg["share_obs_space"] = (
             self.envs.share_observation_space
@@ -119,53 +109,41 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             else self.envs.observation_space
         )
         model_cfg["act_space"] = self.envs.action_space
-        # Whether we use obs instead of state (for centralized critic)
         model_cfg["use_obs_instead_of_state"] = self.use_obs_instead_of_state
-
-        # These come from env action space (not PKL)
         model_cfg["num_actions"] = self.envs.action_space[0].n
         model_cfg["obs_channels"] = self.envs.observation_space[0].shape[-1]
         model_cfg["share_obs_channels"] = self.envs.share_observation_space[0].shape[-1]
         model_cfg["obs_height"] = self.envs.observation_space[0].shape[0]
         model_cfg["obs_width"] = self.envs.observation_space[0].shape[1]
-        # -----------------------
-        # Override trainer config
-        # -----------------------
-        # HMARLTrainer’s batch_size = number of parallel rollout envs
-        trainer_cfg["batch_size"] = self.all_args.n_rollout_threads
-        # Number of skills in trainer must match model
-        trainer_cfg["N_skills"] = model_cfg["num_skills"]
-        # Ensure steps_per_assign is mirrored
-        trainer_cfg["steps_per_assign"] = model_cfg["steps_per_assign"]
-        
 
-        # Create instance of algorithm 
+        # Override trainer config
+        trainer_cfg["batch_size"] = self.all_args.n_rollout_threads
+        trainer_cfg["N_skills"] = model_cfg["num_skills"]
+        trainer_cfg["steps_per_assign"] = model_cfg["steps_per_assign"]
+
+        # Instantiate manager trainer and policy
         TrainAlgo, Policy = HMARLTrainer, HMARLModel
         combined_cfg = {"trainer": trainer_cfg, "model": model_cfg}
         self.trainer = TrainAlgo(combined_cfg, self.device)
-        self.policy = self.trainer.hsd  # ensure policy is from trainer
+        self.policy = self.trainer.hsd
 
         # dump policy config to allow loading population in yaml form
         self.policy_config = model_cfg
         policy_config_path = os.path.join(self.run_dir, "policy_config.pkl")
         pickle.dump(self.policy_config, open(policy_config_path, "wb"))
         print(f"Pickle dump policy config at {policy_config_path}")
-        
-        # not implemented?
+
         if "store" in self.experiment_name:
             exit()
 
-        # load pretrained policy
-        if self.model_dir is not None: 
-            self.restore() 
+        if self.model_dir is not None:
+            self.restore()
 
-        # for training br
         self.br_best_sparse_r = 0
         self.br_eval_json = {}
 
     def run(self):
-        # train sp
-        obs, share_obs, available_actions = self.warmup() # changed from original warmup
+        obs, share_obs, available_actions = self.warmup()
 
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
@@ -175,20 +153,16 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             s_time = time.time()
 
             for step in range(self.episode_length):
-                # Sample actions based on recent environment interaction
-                # Trainer internally hides actual details, only prints out low level action
-                actions = self.collect(step, obs, share_obs, available_actions) # [n_rollout_threads, num_agents,] where each entry is action 0 ~ 5 
-                # Interact with the environment to get observations, rewards, and next observations
+                actions = self.collect(step, obs, share_obs, available_actions)
                 (
                     _obs_batch_single_agent,
                     share_obs_next,
-                    rewards, # shape: [n_rollout_threads, num_agents (actual), 1]
+                    rewards,
                     dones,
                     infos,
                     available_actions_next,
-                ) = self.envs.step(actions) # actions requirement: [n_rollout_threads, num_agents, 1] 0 ~ 5
+                ) = self.envs.step(actions)
 
-                # ===>>> Extract all_agent_obs from info_list <<<===
                 obs_next, share_obs_next, available_actions_next = self.info_translation(infos)
                 total_num_steps += self.n_rollout_threads
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
@@ -200,37 +174,26 @@ class OvercookedRunnerHMARL(OvercookedRunner):
 
                 obs, share_obs, rewards, available_actions = obs_next, share_obs_next, rewards, available_actions_next
 
-            print("episode training finished: ", episode)
             e_time = time.time()
             logger.trace(f"Rollout time: {e_time - s_time:.3f}s")
 
-            # compute return and update network
             s_time = time.time()
-            # self.compute()
             train_infos = self.train(episode)
             e_time = time.time()
             logger.trace(f"Update models time: {e_time - s_time:.3f}s")
 
-            # post process
-            s_time = time.time()
             total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads
-            
-            # save model (overriden because HMARL has multiple networks than rMAPPO, ...)
+
             if episode < 50:
                 if episode % 2 == 0:
-                    # self.save(episode)
                     self.save(total_num_steps)
             elif episode < 100:
                 if episode % 5 == 0:
                     self.save(total_num_steps)
-                    # self.save(episode)
             else:
                 if episode % self.save_interval == 0 or episode == episodes - 1:
                     self.save(total_num_steps)
-                    # self.save(episode)
-            
-            print("episode training finished: ", episode)
-            # log information
+
             if episode % self.log_interval == 0 or episode == episodes - 1:
                 end = time.time()
                 eta_t = eta(start, end, self.num_env_steps, total_num_steps)
@@ -264,28 +227,18 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                     )
                 )
 
-                # HMARL-specific debug logs
                 if "epsilon" in train_infos:
                     logger.info(f"epsilon={train_infos['epsilon']:.4f}, alpha={train_infos['alpha']:.4f}")
-
                 if "decoder_expected_prob" in train_infos:
                     logger.info(f"decoder expected prob={train_infos['decoder_expected_prob']:.4f}")
-
                 if "intrinsic_reward_mean" in train_infos:
                     logger.info(f"intrinsic_reward_mean={train_infos['intrinsic_reward_mean']:.4f}")
-
                 if "high_level_reward_mean" in train_infos:
                     logger.info(f"high_level_reward_mean={train_infos['high_level_reward_mean']:.4f}")
-
                 if "skill_usage" in train_infos:
                     su = train_infos["skill_usage"]
                     logger.info(f"skill_usage={['{:.2f}'.format(x) for x in su]}")
 
-                # # shaped reward
-                # train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards) * self.episode_length
-                # logger.info("average episode rewards is {:.3f}".format(train_infos["average_episode_rewards"]))
-
-                # get information of env
                 env_infos = defaultdict(list)
                 if self.env_name == "Overcooked":
                     if self.all_args.overcooked_version == "old":
@@ -302,75 +255,41 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                         for a in range(self.num_agents):
                             env_infos[f"ep_sparse_r_by_agent{a}"].append(info["episode"]["ep_sparse_r_by_agent"][a])
                             env_infos[f"ep_shaped_r_by_agent{a}"].append(info["episode"]["ep_shaped_r_by_agent"][a])
-                            
                             for i, k in enumerate(shaped_info_keys):
                                 env_infos[f"ep_{k}_by_agent{a}"].append(info["episode"]["ep_category_r_by_agent"][a][i])
                         env_infos["ep_sparse_r"].append(info["episode"]["ep_sparse_r"])
                         env_infos["ep_shaped_r"].append(info["episode"]["ep_shaped_r"])
-                print("train_infos:", train_infos)
-                self.log_train(train_infos, total_num_steps) # requirement: train_info be [num_agents] with scalar values
-                self.log_env(env_infos, total_num_steps) # prints log env infos
+                self.log_train(train_infos, total_num_steps)
+                self.log_env(env_infos, total_num_steps)
                 if self.use_wandb:
                     wandb.log({"train/ETA": eta_t}, step=total_num_steps)
+                print(env_infos["ep_sparse_r"])
                 logger.info(f'average sparse rewards is {np.mean(env_infos["ep_sparse_r"]):.3f}')
-            
-            # eval
+
             if episode % self.eval_interval == 0 and self.use_eval or episode == episodes - 1:
                 self.eval(total_num_steps)
-            e_time = time.time()
-            logger.trace(f"Post update models time: {e_time - s_time:.3f}s")
 
-    def warmup(self): # override to fit HMARLTrainer
-        # ===>>> 표준 Gym format: reset returns (obs_batch, info_list) <<<===
+    def warmup(self):
         obs_batch, info_list = self.envs.reset()
-        
-        # ===>>> info_list에서 데이터 추출 <<<===
-        # all_agent_obs 추출 및 쌓기 -> (n_rollout_threads, num_agents, H, W, C)
         all_agent_obs = np.array([info['all_agent_obs'] for info in info_list])
-        
-        # share_obs 추출 및 쌓기 -> (n_rollout_threads, num_agents, H, W, C_share)
         share_obs = np.array([info['share_obs'] for info in info_list])
-        
-        # available_actions 추출 및 쌓기 -> (n_rollout_threads, num_agents, num_actions)
         available_actions = np.array([info['available_actions'] for info in info_list])
-        # ===>>> 추출 끝 <<<===
-
-        # 우리가 쓰는 버퍼는 오로지 Q함수 학습용이므로 warmup 함수를 변화시킨다.
         return all_agent_obs, share_obs, available_actions
-
-    # # merge rollout, batch into single batch dimension (also done in overcooked_runner)
-    # def transform(self, input):
-    #     shape = input.shape
-    #     return input.reshape(shape[0] * shape[1], *shape[2:])
-    # # separete batch dim into rollout, batch dims (rollout comes first)
-    # def inverse_transform(self, input, n_rollout_threads):
-    #     shape = input.shape
-    #     return input.reshape(n_rollout_threads, shape[0] // n_rollout_threads, *shape[1:])
 
     def info_translation(self, info_list):
-        # Extract data from info_list
         all_agent_obs = np.array([info['all_agent_obs'] for info in info_list])
         share_obs = np.array([info['share_obs'] for info in info_list])
         available_actions = np.array([info['available_actions'] for info in info_list])
         return all_agent_obs, share_obs, available_actions
 
-
-    # from current step inside episode, collect actions and related variables for trainer
-    # only used during training step
     @torch.no_grad()
-    def collect(self, step, obs, share_obs, available_actions): # override to fit HMARLTrainer
-        self.trainer.prep_rollout() # set eval mode for policy
-
-
-        # trainer internally includes policy, and updates buffers, current skills, intrinsic rewards, ... internally
-        # so it only prints out actions, actual training algorithm of hmarl is hidden
+    def collect(self, step, obs, share_obs, available_actions):
+        self.trainer.prep_rollout()
         actions = self.trainer.get_actions_algorithm(step, obs, share_obs, available_actions)
-
         return actions
 
-    def insert(self, data): # override to fit HMARLTrainer
+    def insert(self, data):
         step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones = data
-
         self.trainer.update_buffer(
             step,
             obs,
@@ -382,62 +301,29 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             dones,
         )
 
-
     def restore(self):
-        # load config
         policy_cfg_path = os.path.join(self.model_dir, "policy_config.pkl")
         model_cfg = pickle.load(open(policy_cfg_path, "rb"))
-
-        # re-initialize model correctly
         self.policy = HMARLModel(model_cfg)
 
-        # find latest model file
         model_files = [f for f in os.listdir(self.model_dir) if f.startswith("model_")]
         model_files.sort()
         latest_model = model_files[-1]
 
-        # load model state
         model_path = os.path.join(self.model_dir, latest_model)
-        checkpoint = torch.load(model_path, map_location=self.device)
-
         self.policy.load(model_path)
-
 
     def train(self, num_steps: int = 0):
         self.trainer.prep_training()
         train_infos = self.trainer.training_step(num_steps)
-        # self.log_system() not implemented even in original runners
-        print("train_infos in overcooked_runner_hmarl:", train_infos)
-        return train_infos # return dict, not list
-    
-    def save(self, step): # override to store all networks of HMARL (TODO)
-        # logger.info(f"save sp periodic_{step}.pt")
-        # if self.use_single_network:
-        #     policy_model = self.trainer.policy.model
-        #     torch.save(
-        #         policy_model.state_dict(),
-        #         str(self.save_dir) + f"/model_periodic_{step}.pt",
-        #     )
-        # else:
-        #     policy_actor = self.trainer.policy.actor
-        #     torch.save(
-        #         policy_actor.state_dict(),
-        #         str(self.save_dir) + f"/actor_periodic_{step}.pt",
-        #     )
-        #     if save_critic:
-        #         policy_critic = self.trainer.policy.critic
-        #         torch.save(
-        #             policy_critic.state_dict(),
-        #             str(self.save_dir) + f"/critic_periodic_{step}.pt",
-        #         )
+        return train_infos
+
+    def save(self, step):
         self.trainer.save(step, self.save_dir)
 
-    # change eval to fit HMARLTrainer
     @torch.no_grad()
     def eval(self, total_num_steps):
         eval_env_infos = defaultdict(list)
-        
-        # shaped info keys
         if self.env_name == "Overcooked":
             if self.all_args.overcooked_version == "old":
                 from zsceval.envs.overcooked.overcooked_ai_py.mdp.overcooked_mdp import SHAPED_INFOS
@@ -445,29 +331,23 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 from zsceval.envs.overcooked_new.src.overcooked_ai_py.mdp.overcooked_mdp import SHAPED_INFOS
             shaped_info_keys = SHAPED_INFOS
 
-        # === Reset eval envs ===
         obs_batch, info_list = self.eval_envs.reset()
         obs = np.array([info['all_agent_obs'] for info in info_list])
         share_obs = np.array([info['share_obs'] for info in info_list])
         available_actions = np.array([info['available_actions'] for info in info_list])
 
-        # For logging rewards
         episode_rewards = np.zeros((self.n_eval_rollout_threads, self.num_agents))
 
-        self.trainer.prep_rollout()  # set eval mode
+        self.trainer.prep_rollout()
 
         for step in range(self.episode_length):
-            # HMARLModel deterministic act
             actions = self.trainer.hsd.get_actions_algorithm(
                 step,
                 obs,
                 share_obs,
                 available_actions,
-                epsilon=0.0  # no exploration in eval
+                epsilon=0.0
             )
-            # actions = self.inverse_transform(actions, self.n_eval_rollout_threads)
-            # print("eval actions shape:", actions.shape)
-            # Step the environment
             (
                 _obs_single_agent,
                 share_obs_next,
@@ -475,17 +355,12 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 dones,
                 infos,
                 available_actions_next,
-            ) = self.eval_envs.step(actions) # actions requirement: [n_eval_rollout_threads, num_agents,]
+            ) = self.eval_envs.step(actions)
 
-            # Extract next obs
             obs_next, share_obs_next, available_actions_next = self.info_translation(infos)
-
-            # Accumulate rewards
             episode_rewards += rewards.squeeze(-1)
-
             obs, share_obs, available_actions = obs_next, share_obs_next, available_actions_next
 
-        # --- Logging ---
         for eval_info in infos:
             ep = eval_info["episode"]
             eval_env_infos["eval_sparse_r"].append(ep["ep_sparse_r"])
@@ -495,7 +370,6 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         self.log_env(eval_env_infos, total_num_steps)
 
         eval_env_infos["eval_average_episode_rewards"] = np.mean(episode_rewards)
-
         self.log_env(eval_env_infos, total_num_steps)
 
     @torch.no_grad()
@@ -520,7 +394,6 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                     available_actions,
                     epsilon=0.0,
                 )
-                print("render actions shape:", actions.shape)
                 (
                     _obs_single_agent,
                     share_obs_next,

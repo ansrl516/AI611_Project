@@ -4,6 +4,7 @@ import json
 import pprint
 import time
 from collections import defaultdict
+import os
 from os import path as osp
 from typing import Dict
 from pathlib import Path
@@ -18,7 +19,7 @@ from tqdm import tqdm
 
 from zsceval.runner.shared.base_runner import *
 from zsceval.runner.separated.overcooked_runner import OvercookedRunner
-from zsceval.algorithms.hierarchical_marl_zsc.hmarl_trainer import HMARLTrainer
+from zsceval.algorithms.hierarchical_marl_zsc.hmarl_trainer import HMARLTrainer, HMARLTrainer_PerAgent
 from zsceval.algorithms.hierarchical_marl_zsc.hmarl_policy import HMARLModel
 from zsceval.algorithms.hierarchical_marl_zsc.utils.replay_buffer import Replay_Buffer
 
@@ -28,6 +29,18 @@ from zsceval.utils.log_util import eta, get_table_str
 def _t2n(x):
     return x.detach().cpu().numpy()
 
+
+def _init_fcp_pool(pool_dir: Path):
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    return sorted([p for p in pool_dir.glob("*.pt") if p.is_file()])
+
+
+def _sample_fcp_pool(pool_paths, k: int):
+    if k <= 0 or len(pool_paths) == 0:
+        return []
+    replace = len(pool_paths) < k
+    sampled = np.random.choice(pool_paths, size=k, replace=replace)
+    return list(sampled)
 
 class OvercookedRunnerHMARL(OvercookedRunner):
     """
@@ -94,6 +107,15 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             self.save_dir = self.run_dir / "models"
             self.save_dir.mkdir(parents=True, exist_ok=True)
 
+        self.fcp_pool_dir = Path(getattr(self.all_args, "fcp_pool_dir", self.run_dir / "fcp_pool"))
+        self.fcp_pool = _init_fcp_pool(self.fcp_pool_dir)
+        self.fcp_partner_ids = []
+        self.fcp_pool_add_step_threshold = getattr(
+            self.all_args, "fcp_pool_add_step_threshold", self.num_env_steps
+        )
+        self.fcp_pool_min_eval_sparse = getattr(self.all_args, "fcp_pool_min_eval_sparse", -np.inf)
+        self.last_eval_sparse = None
+
         # 나머지 코드에서 쓸 때는:
         # str(self.run_dir), str(self.save_dir) 로 필요할 때만 문자열 변환
         # load HMARL specific parameters from specific config directory
@@ -139,14 +161,20 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         trainer_cfg["steps_per_assign"] = model_cfg["steps_per_assign"]
         
 
-        # Create instance of algorithm 
-        TrainAlgo, Policy = HMARLTrainer, HMARLModel
+        # Create instance of algorithm per agent (same config, separate parameters)
+        TrainAlgo, Policy = HMARLTrainer_PerAgent, HMARLModel
         combined_cfg = {"trainer": trainer_cfg, "model": model_cfg}
-        self.trainer = TrainAlgo(combined_cfg, self.device)
-        self.policy = self.trainer.hsd  # ensure policy is from trainer
+        self.trainer = []
+        self.policy = []
+
+        for _ in range(self.num_agents):
+            cfg_copy = copy.deepcopy(combined_cfg)
+            trainer = TrainAlgo(cfg_copy, self.device)
+            self.trainer.append(trainer)
+            self.policy.append(trainer.hsd)
 
         # dump policy config to allow loading population in yaml form
-        self.policy_config = model_cfg
+        self.policy_config = copy.deepcopy(model_cfg)
         policy_config_path = os.path.join(self.run_dir, "policy_config.pkl")
         pickle.dump(self.policy_config, open(policy_config_path, "wb"))
         print(f"Pickle dump policy config at {policy_config_path}")
@@ -163,8 +191,40 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         self.br_best_sparse_r = 0
         self.br_eval_json = {}
 
-    def run(self):
+    def _load_fcp_partners(self):
+        self.fcp_partner_ids = []
+        num_partners = max(0, min(self.num_agents - 1, len(self.trainer) - 1))
+        sampled_paths = _sample_fcp_pool(self.fcp_pool, num_partners)
+        if not sampled_paths:
+            return
+        for idx, model_path in enumerate(sampled_paths, start=1): # 0 stands for trainable ego
+            self.trainer[idx].hsd.load(str(model_path), map_location=self.device)
+            self.policy[idx] = self.trainer[idx].hsd
+            self.fcp_partner_ids.append(idx)
+
+    def _append_agent0_to_pool(self, total_num_steps: int):
+        if not self.trainer:
+            return
+        if total_num_steps < self.fcp_pool_add_step_threshold:
+            logger.info(
+                f"[FCP pool] skip append: total steps {total_num_steps} < threshold {self.fcp_pool_add_step_threshold}"
+            )
+            return
+        if self.fcp_pool_min_eval_sparse > -np.inf:
+            if self.last_eval_sparse is None or self.last_eval_sparse < self.fcp_pool_min_eval_sparse:
+                logger.info(
+                    f"[FCP pool] skip append: eval sparse {self.last_eval_sparse} < min "
+                    f"{self.fcp_pool_min_eval_sparse}"
+                )
+                return
+        timestamp = int(time.time() * 1000)
+        save_path = self.fcp_pool_dir / f"pool_agent0_{timestamp}.pt"
+        self.trainer[0].hsd.save(str(save_path))
+        self.fcp_pool.append(save_path)
+
+    def run_stage(self): # uploads nontrainable trainer&policies to agent index 1 ~ num_agent-1 
         # train sp
+        self._load_fcp_partners()
         obs, share_obs, available_actions = self.warmup() # changed from original warmup
 
         start = time.time()
@@ -265,21 +325,34 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 )
 
                 # HMARL-specific debug logs
-                if "epsilon" in train_infos:
-                    logger.info(f"epsilon={train_infos['epsilon']:.4f}, alpha={train_infos['alpha']:.4f}")
+                for agent_id in range(self.num_agents):
+                    dep_key = f"decoder_expected_prob_agent{agent_id}"
+                    if dep_key in train_infos:
+                        logger.info(f"[agent{agent_id}] decoder expected prob={train_infos[dep_key]:.4f}")
 
-                if "decoder_expected_prob" in train_infos:
-                    logger.info(f"decoder expected prob={train_infos['decoder_expected_prob']:.4f}")
+                for agent_id in range(self.num_agents):
+                    ir_key = f"intrinsic_reward_mean_agent{agent_id}"
+                    if ir_key in train_infos:
+                        logger.info(f"[agent{agent_id}] intrinsic_reward_mean={train_infos[ir_key]:.4f}")
 
-                if "intrinsic_reward_mean" in train_infos:
-                    logger.info(f"intrinsic_reward_mean={train_infos['intrinsic_reward_mean']:.4f}")
+                for agent_id in range(self.num_agents):
+                    eps_key = f"epsilon_agent{agent_id}"
+                    alpha_key = f"alpha_agent{agent_id}"
+                    if eps_key in train_infos and alpha_key in train_infos:
+                        logger.info(
+                            f"[agent{agent_id}] epsilon={train_infos[eps_key]:.4f}, alpha={train_infos[alpha_key]:.4f}"
+                        )
 
-                if "high_level_reward_mean" in train_infos:
-                    logger.info(f"high_level_reward_mean={train_infos['high_level_reward_mean']:.4f}")
+                for agent_id in range(self.num_agents):
+                    hl_key = f"high_level_reward_mean_agent{agent_id}"
+                    if hl_key in train_infos:
+                        logger.info(f"[agent{agent_id}] high_level_reward_mean={train_infos[hl_key]:.4f}")
 
-                if "skill_usage" in train_infos:
-                    su = train_infos["skill_usage"]
-                    logger.info(f"skill_usage={['{:.2f}'.format(x) for x in su]}")
+                for agent_id in range(self.num_agents):
+                    su_key = f"skill_usage_agent{agent_id}"
+                    if su_key in train_infos:
+                        su = train_infos[su_key]
+                        logger.info(f"[agent{agent_id}] skill_usage={['{:.2f}'.format(x) for x in su]}")
 
                 # # shaped reward
                 # train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards) * self.episode_length
@@ -319,6 +392,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 self.eval(total_num_steps)
             e_time = time.time()
             logger.trace(f"Post update models time: {e_time - s_time:.3f}s")
+        self._append_agent0_to_pool(total_num_steps)
 
     def warmup(self): # override to fit HMARLTrainer
         # ===>>> 표준 Gym format: reset returns (obs_batch, info_list) <<<===
@@ -359,78 +433,76 @@ class OvercookedRunnerHMARL(OvercookedRunner):
     # only used during training step
     @torch.no_grad()
     def collect(self, step, obs, share_obs, available_actions): # override to fit HMARLTrainer
-        self.trainer.prep_rollout() # set eval mode for policy
+        actions_by_agent = []
+        for agent_id, trainer in enumerate(self.trainer):
+            trainer.prep_rollout() # set eval mode for policy
+            obs = obs[:,agent_id] # [n_rollout_threads, H, W, C]
+            share_obs = share_obs[:,agent_id] # [n_rollout_threads, H, W, C_share]
+            available_actions = available_actions[:,agent_id] # [n_rollout_threads, num_actions]
+            # trainer internally includes policy, and updates buffers, current skills, intrinsic rewards, ... internally
+            # so it only prints out actions, actual training algorithm of hmarl is hidden
+            agent_actions = trainer.get_actions_algorithm(step, obs, share_obs, available_actions)
+            agent_actions = np.asarray(agent_actions) # [n_rollout_threads, 1, 1]
+            agent_actions = agent_actions.squeeze(1) # remove the agent dimension
+            actions_by_agent.append(agent_actions)
 
-
-        # trainer internally includes policy, and updates buffers, current skills, intrinsic rewards, ... internally
-        # so it only prints out actions, actual training algorithm of hmarl is hidden
-        actions = self.trainer.get_actions_algorithm(step, obs, share_obs, available_actions)
-
-        return actions
+        stacked_actions = np.stack(actions_by_agent, axis=1)
+        return stacked_actions # [n_rollout_threads, num_agents, 1]
 
     def insert(self, data): # override to fit HMARLTrainer
         step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones = data
 
-        self.trainer.update_buffer(
-            step,
-            obs,
-            share_obs,
-            actions,
-            rewards,
-            obs_next,
-            share_obs_next,
-            dones,
-        )
+        for agent_id, trainer in enumerate(self.trainer):
+            trainer.update_buffer(
+                step,
+                obs[:,agent_id], # [n_rollout_threads, H, W, C]
+                share_obs[:,agent_id], # [n_rollout_threads, H, W, C_share]
+                actions[:,agent_id], # [n_rollout_threads, 1]
+                rewards,
+                obs_next,
+                share_obs_next,
+                dones,
+            )
 
 
     def restore(self):
-        # load config
-        policy_cfg_path = os.path.join(self.model_dir, "policy_config.pkl")
-        model_cfg = pickle.load(open(policy_cfg_path, "rb"))
+        for agent_id, trainer in enumerate(self.trainer):
+            agent_model_dir = getattr(self.all_args, f"model_dir_agent{agent_id}", None) or self.model_dir
+            if agent_model_dir is None:
+                continue
 
-        # re-initialize model correctly
-        self.policy = HMARLModel(model_cfg)
+            policy_cfg_path = os.path.join(agent_model_dir, "policy_config.pkl")
+            if os.path.exists(policy_cfg_path):
+                model_cfg = pickle.load(open(policy_cfg_path, "rb"))
+                trainer.hsd = HMARLModel(model_cfg, device=self.device)
+                self.policy[agent_id] = trainer.hsd
 
-        # find latest model file
-        model_files = [f for f in os.listdir(self.model_dir) if f.startswith("model_")]
-        model_files.sort()
-        latest_model = model_files[-1]
+            model_files = [f for f in os.listdir(agent_model_dir) if f.startswith("model_")]
+            if not model_files:
+                continue
+            model_files.sort()
+            latest_model = model_files[-1]
 
-        # load model state
-        model_path = os.path.join(self.model_dir, latest_model)
-        checkpoint = torch.load(model_path, map_location=self.device)
-
-        self.policy.load(model_path)
+            model_path = os.path.join(agent_model_dir, latest_model)
+            trainer.hsd.load(model_path, map_location=self.device)
 
 
     def train(self, num_steps: int = 0):
-        self.trainer.prep_training()
-        train_infos = self.trainer.training_step(num_steps)
-        # self.log_system() not implemented even in original runners
-        print("train_infos in overcooked_runner_hmarl:", train_infos)
-        return train_infos # return dict, not list
+        all_train_infos = {}
+        for agent_id, trainer in enumerate(self.trainer):
+            if agent_id in self.fcp_partner_ids:
+                continue
+            trainer.prep_training()
+            train_info = trainer.training_step(num_steps)
+            for k, v in train_info.items():
+                all_train_infos[f"{k}_agent{agent_id}"] = v
+        print("train_infos in overcooked_runner_hmarl:", all_train_infos)
+        return all_train_infos # return dict, not list
     
     def save(self, step): # override to store all networks of HMARL (TODO)
-        # logger.info(f"save sp periodic_{step}.pt")
-        # if self.use_single_network:
-        #     policy_model = self.trainer.policy.model
-        #     torch.save(
-        #         policy_model.state_dict(),
-        #         str(self.save_dir) + f"/model_periodic_{step}.pt",
-        #     )
-        # else:
-        #     policy_actor = self.trainer.policy.actor
-        #     torch.save(
-        #         policy_actor.state_dict(),
-        #         str(self.save_dir) + f"/actor_periodic_{step}.pt",
-        #     )
-        #     if save_critic:
-        #         policy_critic = self.trainer.policy.critic
-        #         torch.save(
-        #             policy_critic.state_dict(),
-        #             str(self.save_dir) + f"/critic_periodic_{step}.pt",
-        #         )
-        self.trainer.save(step, self.save_dir)
+        for agent_id, trainer in enumerate(self.trainer):
+            agent_save_dir = Path(self.save_dir) / f"agent{agent_id}"
+            trainer.save(step, str(agent_save_dir))
 
     # change eval to fit HMARLTrainer
     @torch.no_grad()
@@ -454,19 +526,25 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         # For logging rewards
         episode_rewards = np.zeros((self.n_eval_rollout_threads, self.num_agents))
 
-        self.trainer.prep_rollout()  # set eval mode
+        for trainer in self.trainer:
+            trainer.prep_rollout()  # set eval mode
 
         for step in range(self.episode_length):
-            # HMARLModel deterministic act
-            actions = self.trainer.hsd.get_actions_algorithm(
-                step,
-                obs,
-                share_obs,
-                available_actions,
-                epsilon=0.0  # no exploration in eval
-            )
-            # actions = self.inverse_transform(actions, self.n_eval_rollout_threads)
-            # print("eval actions shape:", actions.shape)
+            actions_by_agent = []
+            for agent_id, trainer in enumerate(self.trainer):
+                agent_actions = trainer.hsd.get_actions_algorithm(
+                    step,
+                    obs,
+                    share_obs,
+                    available_actions,
+                    epsilon=0.0  # no exploration in eval
+                )
+                agent_actions = np.asarray(agent_actions)
+                if agent_actions.ndim == 3 and agent_actions.shape[-1] == 1:
+                    agent_actions = agent_actions.squeeze(-1)
+                actions_by_agent.append(agent_actions[:, agent_id])
+
+            actions = np.expand_dims(np.stack(actions_by_agent, axis=1), axis=-1)
             # Step the environment
             (
                 _obs_single_agent,
@@ -497,6 +575,8 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         eval_env_infos["eval_average_episode_rewards"] = np.mean(episode_rewards)
 
         self.log_env(eval_env_infos, total_num_steps)
+        if eval_env_infos["eval_sparse_r"]:
+            self.last_eval_sparse = float(np.mean(eval_env_infos["eval_sparse_r"]))
 
     @torch.no_grad()
     def render(self):
@@ -511,15 +591,24 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             episode_rewards = np.zeros((self.n_render_rollout_threads, self.num_agents))
 
             for step in range(self.episode_length):
-                self.trainer.prep_rollout()
+                for trainer in self.trainer:
+                    trainer.prep_rollout()
 
-                actions = self.trainer.hsd.get_actions_algorithm(
-                    step,
-                    obs,
-                    share_obs,
-                    available_actions,
-                    epsilon=0.0,
-                )
+                actions_by_agent = []
+                for agent_id, trainer in enumerate(self.trainer):
+                    agent_actions = trainer.hsd.get_actions_algorithm(
+                        step,
+                        obs,
+                        share_obs,
+                        available_actions,
+                        epsilon=0.0,
+                    )
+                    agent_actions = np.asarray(agent_actions)
+                    if agent_actions.ndim == 3 and agent_actions.shape[-1] == 1:
+                        agent_actions = agent_actions.squeeze(-1)
+                    actions_by_agent.append(agent_actions[:, agent_id])
+
+                actions = np.expand_dims(np.stack(actions_by_agent, axis=1), axis=-1)
                 print("render actions shape:", actions.shape)
                 (
                     _obs_single_agent,
