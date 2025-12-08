@@ -245,11 +245,11 @@ class HMARLModel:
             self.current_skills = self.assign_skills(obs=obs, share_obs=shared_obs, epsilon=epsilon)  # [B, N]
 
         # 2. Get low-level actions using current skills
-        actions = self.get_actions_low(obs, available_actions, self.current_skills)  # [B, N]
+        actions = self.get_actions_low(obs, available_actions, self.current_skills, epsilon=epsilon)  # [B, N]
 
         return self._format_actions(actions)  # [B, N, 1]
 
-    def get_actions_low(self, obs, available_actions, skills):
+    def get_actions_low(self, obs, available_actions, skills, epsilon=None):
         """
         Compute low-level control actions conditioned on current skills.
 
@@ -257,6 +257,7 @@ class HMARLModel:
             obs:               (B, N, H, W, C)
             available_actions: (B, N, A)
             skills:            (B, N) int skill indices
+            epsilon:           optional exploration rate for low-level (float)
 
         Returns:
             actions: (B, N) int actions
@@ -274,6 +275,9 @@ class HMARLModel:
         # one-hot skills
         skills_onehot = F.one_hot(skills_t, num_classes=self.num_skills).float()  # (B, N, K)
 
+        if epsilon is None:
+            epsilon = 0.0
+
         with torch.no_grad():
             q = self.Q_low(obs_encoded, skills_onehot)  # (B, N, A)
 
@@ -283,7 +287,21 @@ class HMARLModel:
             # greedy per-agent action
             actions = torch.argmax(q_masked, dim=2)  # (B, N)
 
-        return actions.cpu().numpy()
+            actions_np = actions.cpu().numpy()
+
+            # epsilon-greedy exploration over available actions
+            if epsilon > 0.0:
+                avail_np = avail_t.cpu().numpy()
+                explore_mask = np.random.rand(*actions_np.shape) < epsilon
+                explore_indices = np.argwhere(explore_mask)
+                for b, n in explore_indices:
+                    avail = avail_np[b, n]
+                    if avail.any():
+                        actions_np[b, n] = np.random.choice(np.nonzero(avail)[0])
+                    else:
+                        actions_np[b, n] = np.random.randint(self.num_actions)
+
+        return actions_np
 
     def assign_skills(self, obs, share_obs=None, epsilon=None):
         """
