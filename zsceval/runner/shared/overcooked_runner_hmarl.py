@@ -189,7 +189,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 ) = self.envs.step(actions) # actions requirement: [n_rollout_threads, num_agents, 1] 0 ~ 5
 
                 # ===>>> Extract all_agent_obs from info_list <<<===
-                obs_next, share_obs_next, available_actions_next = self.info_translation(infos)
+                obs_next, share_obs_next, available_actions_next, _ = self.info_translation(infos)
                 total_num_steps += self.n_rollout_threads
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
 
@@ -300,12 +300,10 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                         shaped_info_keys = SHAPED_INFOS
                     for info in infos:
                         for a in range(self.num_agents):
-                            env_infos[f"ep_sparse_r_by_agent{a}"].append(info["episode"]["ep_sparse_r_by_agent"][a])
                             env_infos[f"ep_shaped_r_by_agent{a}"].append(info["episode"]["ep_shaped_r_by_agent"][a])
                             
                             for i, k in enumerate(shaped_info_keys):
                                 env_infos[f"ep_{k}_by_agent{a}"].append(info["episode"]["ep_category_r_by_agent"][a][i])
-                        env_infos["ep_sparse_r"].append(info["episode"]["ep_sparse_r"])
                         env_infos["ep_shaped_r"].append(info["episode"]["ep_shaped_r"])
                 print("train_infos:", train_infos)
                 self.log_train(train_infos, total_num_steps) # requirement: train_info be [num_agents] with scalar values
@@ -352,7 +350,8 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         all_agent_obs = np.array([info['all_agent_obs'] for info in info_list])
         share_obs = np.array([info['share_obs'] for info in info_list])
         available_actions = np.array([info['available_actions'] for info in info_list])
-        return all_agent_obs, share_obs, available_actions
+        # rewards = np.array([info['shaped_rewards'] for info in info_list])
+        return all_agent_obs, share_obs, available_actions, None
 
 
     # from current step inside episode, collect actions and related variables for trainer
@@ -367,6 +366,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         actions = self.trainer.get_actions_algorithm(step, obs, share_obs, available_actions)
 
         return actions
+
 
     def insert(self, data): # override to fit HMARLTrainer
         step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones = data
@@ -478,7 +478,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             ) = self.eval_envs.step(actions) # actions requirement: [n_eval_rollout_threads, num_agents,]
 
             # Extract next obs
-            obs_next, share_obs_next, available_actions_next = self.info_translation(infos)
+            obs_next, share_obs_next, available_actions_next, _ = self.info_translation(infos)
 
             # Accumulate rewards
             episode_rewards += rewards.squeeze(-1)
@@ -530,7 +530,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                     available_actions_next,
                 ) = envs.step(actions)
 
-                obs_next, share_obs_next, available_actions_next = self.info_translation(infos)
+                obs_next, share_obs_next, available_actions_next, _ = self.info_translation(infos)
 
                 episode_rewards += rewards
 

@@ -12,11 +12,12 @@ import zsceval.algorithms.hierarchical_marl_zsc.utils.networks as networks
 def hard_update(target, source):
     for targ_param, src_param in zip(target.parameters(), source.parameters()):
         targ_param.data.copy_(src_param.data)
- 
+
+
 # HMARL for ZSC-Eval
-class HMARLModel: 
+class HMARLModel:
     def __init__(self, cfg_m, device=torch.device("cpu")):
-        """Current Implmentation does not support environment batching
+        """Current Implementation does not support environment batching
         Args:
             rMAPPO-style structured config:
 
@@ -44,7 +45,7 @@ class HMARLModel:
             - Use compute_intrinsic_reward() to get decoder-based intrinsic rewards
 
         """
-        
+
         # Model settings
         self.num_agents = cfg_m["num_agents"]
         self.num_actions = cfg_m["num_actions"]
@@ -85,68 +86,103 @@ class HMARLModel:
         # ----------------------------------------------------------------------
         # Build networks
         # ----------------------------------------------------------------------
-        self.obs_encoder = networks.ObsEncoder(self.C, self.obs_dim, self.H, self.W).to(self.device)
-        self.share_obs_encoder = networks.ShareObsEncoder(self.C_share, self.state_dim, self.H, self.W).to(self.device)
+        self.obs_encoder = networks.ObsEncoder(
+            self.C, self.obs_dim, self.H, self.W
+        ).to(self.device)
+        self.share_obs_encoder = networks.ShareObsEncoder(
+            self.C_share, self.state_dim, self.H, self.W
+        ).to(self.device)
 
         # Decoder
-        self.traj_length_downsampled = int(np.floor(self.steps_per_assign / self.traj_skip))
+        self.traj_length_downsampled = int(
+            np.floor(self.steps_per_assign / self.traj_skip)
+        )
         decoder_input_dim = self.obs_truncate_length or self.obs_dim
         self.decoder = networks.Decoder(
             decoder_input_dim,
             self.traj_length_downsampled,
             self.nn["n_h_decoder"],
-            self.num_skills
+            self.num_skills,
         ).to(self.device)
 
-        self.decoder_opt = torch.optim.Adam(self.decoder.parameters(), lr=self.lr_decoder)
+        self.decoder_opt = torch.optim.Adam(
+            self.decoder.parameters(), lr=self.lr_decoder
+        )
         self.ce_loss = nn.CrossEntropyLoss()
 
         # Low-level Q-functions
-        self.Q_low = networks.QLow(self.obs_dim, self.num_skills,
-                                   self.nn["n_h1_low"], self.nn["n_h2_low"], self.num_actions).to(self.device)
-        self.Q_low_target = networks.QLow(self.obs_dim, self.num_skills,
-                                          self.nn["n_h1_low"], self.nn["n_h2_low"], self.num_actions).to(self.device)
+        self.Q_low = networks.QLow(
+            self.obs_dim,
+            self.num_skills,
+            self.nn["n_h1_low"],
+            self.nn["n_h2_low"],
+            self.num_actions,
+        ).to(self.device)
+        self.Q_low_target = networks.QLow(
+            self.obs_dim,
+            self.num_skills,
+            self.nn["n_h1_low"],
+            self.nn["n_h2_low"],
+            self.num_actions,
+        ).to(self.device)
         hard_update(self.Q_low_target, self.Q_low)
         self.low_opt = torch.optim.Adam(self.Q_low.parameters(), lr=self.lr_Q)
 
-        # High-level Qmix
-        self.agent_main = networks.QmixSingle(self.obs_dim,
-                                              self.nn["n_h1_high"], self.nn["n_h2_high"],
-                                              self.num_skills).to(self.device)
-        self.agent_target = networks.QmixSingle(self.obs_dim,
-                                                self.nn["n_h1_high"], self.nn["n_h2_high"],
-                                                self.num_skills).to(self.device)
+        # High-level Qmix (agent utilities from local obs, mixer from shared obs)
+        self.agent_main = networks.QmixSingle(
+            self.obs_dim,
+            self.nn["n_h1_high"],
+            self.nn["n_h2_high"],
+            self.num_skills,
+        ).to(self.device)
+        self.agent_target = networks.QmixSingle(
+            self.obs_dim,
+            self.nn["n_h1_high"],
+            self.nn["n_h2_high"],
+            self.num_skills,
+        ).to(self.device)
 
-        self.mixer_main = networks.QmixMixer(self.state_dim, self.num_agents, self.nn["n_h_mixer"]).to(self.device)
-        self.mixer_target = networks.QmixMixer(self.state_dim, self.num_agents, self.nn["n_h_mixer"]).to(self.device)
+        self.mixer_main = networks.QmixMixer(
+            self.state_dim, self.num_agents, self.nn["n_h_mixer"]
+        ).to(self.device)
+        self.mixer_target = networks.QmixMixer(
+            self.state_dim, self.num_agents, self.nn["n_h_mixer"]
+        ).to(self.device)
         hard_update(self.agent_target, self.agent_main)
         hard_update(self.mixer_target, self.mixer_main)
 
         self.high_opt = torch.optim.Adam(
             list(self.agent_main.parameters()) + list(self.mixer_main.parameters()),
-            lr=self.lr_Q
+            lr=self.lr_Q,
         )
         self.loss_fn = nn.MSELoss()
 
         # Internal states
         self.current_skills = None
         self.step = 0
-    
+
     ## --- API functions for using it as pretrained policy pool inside separated overcooked runner --- ##
-    
-    # getting fixed actions for this policy (only used as fixed)
+
     @torch.no_grad()
-    def get_actions(self, share_obs, obs, rnn_states, rnn_states_critic, masks, available_actions):
+    def get_actions(
+        self,
+        share_obs,
+        obs,
+        rnn_states,
+        rnn_states_critic,
+        masks,
+        available_actions,
+    ):
         # Dummies: rnn_states, rnn_states_critic, action_log_prob, masks
         """
         Inputs:
-            share_obs: (batch, num_agents, H, W, C_share) <- each num_agents stands for an agent shared observation 
-            obs:       (batch, num_agents, H, W, C) <- each num_agents stands for an agent observation
+            share_obs: (batch, num_agents, H, W, C_share)
+            obs:       (batch, num_agents, H, W, C)
             rnn_states: (batch, num_agents, rnn_N, hidden)  (unused placeholder)
             rnn_states_critic: (batch, num_agents, rnn_N, hidden)  (unused placeholder)
             masks:      (batch, 1)
             available_actions: (batch, num_agents, num_actions)
-        
+
         Outputs (all tensors):
             value:              (batch, num_agents, 1)  (dummy zeros)
             action:             (batch, num_agents, 1)  (discrete index per agent)
@@ -158,13 +194,10 @@ class HMARLModel:
         batch_size = obs.shape[0]
         device = obs.device
 
-        # ---- VALUE (dummy, fixed policy has no critic) ----
-        # MUST be shape (batch, num_agents, 1)
+        # value (dummy critic)
         value = torch.zeros((batch_size, self.num_agents, 1), device=device)
 
-        # ---- ACTION ----
-        # Fixed pretrained policy uses a feedforward actor
-        # actor(obs) must return shape: (batch_size, act_dim)
+        # actions from hierarchical policy
         action = self.get_actions_algorithm(
             steps=self.step,
             obs=obs,
@@ -173,16 +206,11 @@ class HMARLModel:
             epsilon=0.0,
         )
 
-        # ---- ACTION LOG PROB ----
-        # A fixed deterministic policy can return zero logs
+        # dummy log-probs and rnn states
         action_log_prob = torch.zeros((batch_size, self.num_agents, 1), device=device)
-
-        # ---- NEXT RNN STATES ----
-        # Must match shape of input state
-        next_rnn_state = torch.zeros_like(rnn_states)           # safe dummy
+        next_rnn_state = torch.zeros_like(rnn_states)
         next_rnn_state_critic = torch.zeros_like(rnn_states_critic)
 
-        # Increment internal step counter
         self.step += 1
 
         return value, action, action_log_prob, next_rnn_state, next_rnn_state_critic
@@ -190,7 +218,6 @@ class HMARLModel:
     # getting fixed actions for this policy (only used as fixed)
     def act(self, obs, rnn_state, mask, available_actions=None, deterministic=True):
         # Dummies: rnn_state, mask, deterministic
-        # share_obs is not used in low-level acting when deterministic
         action = self.get_actions_algorithm(
             steps=self.step,
             obs=obs,
@@ -204,23 +231,23 @@ class HMARLModel:
 
     # dummy function for API compatibility
     def lr_decay(self, episode, total):
-        pass   # no-op    
-    
+        pass  # no-op
+
     ## --- End of API functions --- ##
 
     ## --- Core action functions for hierarchical MARL with skill discovery --- ##
 
     @torch.no_grad()
     def get_actions_algorithm(self, steps, obs, shared_obs, available_actions, epsilon=None):
-        """ Wraps get_actions_low and assign_skills with internal variables, implements hmarl logic. """
+        """Wraps get_actions_low and assign_skills with internal variables, implements HMARL logic."""
         # 1. Assign skills at the beginning and every steps_per_assign
         if steps % self.steps_per_assign == 0:
-            self.current_skills = self.assign_skills(shared_obs, epsilon=epsilon) # shape: [batch_size, num_agents]
+            self.current_skills = self.assign_skills(shared_obs, epsilon=epsilon)  # [B, N]
 
         # 2. Get low-level actions using current skills
-        actions = self.get_actions_low(obs, available_actions, self.current_skills) # shape: [batch_size, num_agents]
+        actions = self.get_actions_low(obs, available_actions, self.current_skills)  # [B, N]
 
-        return self._format_actions(actions) # returns shape: [batch_size, num_agents, 1] (final 1 is dummy)
+        return self._format_actions(actions)  # [B, N, 1]
 
     def get_actions_low(self, obs, available_actions, skills):
         """
@@ -235,38 +262,26 @@ class HMARLModel:
             actions: (B, N) int actions
         """
 
-        # ---------------------------------------
-        # Shape & basic conversion
-        # ---------------------------------------
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)            # (B, N, H, W, C)
-        skills = torch.as_tensor(skills, dtype=torch.long, device=self.device)         # (B, N)
-        avail = torch.as_tensor(available_actions, dtype=torch.bool, device=self.device) # (B, N, A)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)          # (B, N, H, W, C)
+        skills_t = torch.as_tensor(skills, dtype=torch.long, device=self.device)       # (B, N)
+        avail_t = torch.as_tensor(
+            available_actions, dtype=torch.bool, device=self.device
+        )  # (B, N, A)
 
-        B, N = skills.shape
+        # encode observations
+        obs_encoded = self.obs_encoder(obs_t)  # (B, N, obs_dim)
 
-        # ---------------------------------------
-        # Encode observations
-        # obs_encoder: (B, N, H, W, C) -> (B, N, obs_dim)
-        # ---------------------------------------
-        obs_encoded = self.obs_encoder(obs)    # (B, N, obs_dim)
+        # one-hot skills
+        skills_onehot = F.one_hot(skills_t, num_classes=self.num_skills).float()  # (B, N, K)
 
-        # ---------------------------------------
-        # One-hot encode skills
-        # ---------------------------------------
-        skills_onehot = F.one_hot(skills, num_classes=self.num_skills).float()   # (B, N, K)
-
-        # ---------------------------------------
-        # Low-level Q-network
-        # Q_low: (obs, skills_onehot) => (B, N, A)
-        # ---------------------------------------
         with torch.no_grad():
-            q = self.Q_low(obs_encoded, skills_onehot)   # shape: (B, N, A)
+            q = self.Q_low(obs_encoded, skills_onehot)  # (B, N, A)
 
-            # Mask unavailable actions: set to -inf to forbid selection
-            q_masked = q.masked_fill(~avail, float('-inf'))
+            # mask unavailable actions
+            q_masked = q.masked_fill(~avail_t, float("-inf"))
 
-            # Greedy per agent
-            actions = torch.argmax(q_masked, dim=2)      # (B, N)
+            # greedy per-agent action
+            actions = torch.argmax(q_masked, dim=2)  # (B, N)
 
         return actions.cpu().numpy()
 
@@ -274,7 +289,7 @@ class HMARLModel:
         """
         Assign skills to agents via high-level Q-network.
         Args:
-            share_obs: np array of shape [B, N, H, W, C] or [B, N, obs_dim] where B is rollout_threads, N is num_agents
+            share_obs: np array of shape [B, N, H, W, C_share]
             epsilon: exploration rate (float or None)
         Returns:
             skills: np array of shape [B, N]
@@ -283,45 +298,27 @@ class HMARLModel:
         B = share_obs.shape[0]
         N = self.num_agents
 
-        # ----------------------------------------
-        # 1) Handle epsilon default
-        # ----------------------------------------
         if epsilon is None:
             epsilon = 0.0
 
-        # ----------------------------------------
-        # 2) Convert to tensor
-        # ----------------------------------------
-        share_obs = torch.as_tensor(share_obs, dtype=torch.float32, device=self.device)
+        share_obs_t = torch.as_tensor(
+            share_obs, dtype=torch.float32, device=self.device
+        )  # (B, N, H, W, C_share)
 
-        # ----------------------------------------
-        # 3) Encode shared observations
-        #     Expected: share_obs_encoder: (B, N, ...) → (B, N, state_dim)
-        # ----------------------------------------
-        share_encoded = self.share_obs_encoder(share_obs)
-        # print("encoded share_obs:", share_encoded.shape)
+        # encode shared observations to "state" representation
+        state_encoded = self.share_obs_encoder(share_obs_t)  # (B, N, state_dim)
 
-        # ----------------------------------------
-        # 4) Compute Q-values for skills
-        #     agent_main must return shape (B, N, num_skills)
-        # ----------------------------------------
+        # per-agent utilities from local obs: we approximate by reusing the
+        # shared encoding; the important part is: agent_main gets a per-agent
+        # embedding, mixer gets state_encoded.
         with torch.no_grad():
-            q_values = self.agent_main(share_encoded)    # (B, N, K)
-            # Greedy skill choice
-            skills_argmax = torch.argmax(q_values, dim=2)   # (B, N)
-            skills_argmax = skills_argmax.cpu().numpy()
+            q_values = self.agent_main(state_encoded)  # (B, N, K)
+            greedy_skills = torch.argmax(q_values, dim=2).cpu().numpy()  # (B, N)
 
-        # ----------------------------------------
-        # 5) ε-greedy exploration (vectorized)
-        # ----------------------------------------
-        # mask for exploration vs exploitation
+        # epsilon-greedy per agent
         explore_mask = np.random.rand(B, N) < epsilon
-
-        # random skills for exploration
         random_skills = np.random.randint(0, self.num_skills, size=(B, N))
-
-        # combine via mask
-        skills = np.where(explore_mask, random_skills, skills_argmax)
+        skills = np.where(explore_mask, random_skills, greedy_skills)
 
         return skills.astype(np.int32)
 
@@ -329,81 +326,120 @@ class HMARLModel:
 
     ## --- Training related functions for hierarchical MARL with skill discovery --- ##
 
-    def process_batch_high(self, batch): # helper function for high-level policy training
-        # batch: n_steps of [obs_h, share_obs_h, current_skills, rewards_h, next_obs, next_share_obs, done]
-        # shape of obs_h: [batch, num_agents, H, W, C]
-        # shape of share_obs_h: [batch, num_agents, H, W, C_share]
-        # shape of current_skills: [batch, num_agents,] (int skill per agent)
-        # shape of rewards_h: [batch,]
-        # shape of next_obs: [batch, num_agents, H, W, C]
-        # shape of next_share_obs: [batch, num_agents, H, W, C_share]
-        # shape of done: [batch,] (episode termination flag 1 0)
+    def process_batch_high(self, batch):
+        """
+        batch: list of transitions, each:
+            [obs_h, share_obs_h, skills, reward_h, obs_next_h, share_obs_next_h, done_env]
 
-        assert batch.shape[1] == 7, "Batch shape incorrect for high-level policy training."
+        Shapes:
+            obs_h:              (B_env, N, H, W, C)
+            share_obs_h:        (B_env, N, H, W, C_share)
+            skills:             (B_env, N)
+            reward_h:           (B_env,)   scalar reward per environment
+            obs_next_h:         (B_env, N, H, W, C)
+            share_obs_next_h:   (B_env, N, H, W, C_share)
+            done_env:           (B_env,)
+        """
 
-        # merge n_steps and batch dimensions
-        batch = np.asarray(batch) # shape [n_steps, batch, 7] where each i in [7] holds python obj
-        batch = batch.reshape(-1, batch.shape[2]) # shape [n_steps * batch, ...]
+        # Unzip
+        obs_list, share_list, skills_list, reward_list, obsn_list, sharen_list, done_list = zip(*batch)
 
-        # organize batch data
-        obs = np.stack(batch[:, 0]) # shape [n_steps * batch, num_agents, H, W, C]
-        state = np.stack(batch[:, 1]) # shape [n_steps * batch, num_agents, H, W, C_share]
-        skills = np.stack(batch[:, 2]) # shape [n_steps * batch, num_agents,]
-        reward = np.stack(batch[:, 3]) # shape [n_steps * batch,]
-        obs_next = np.stack(batch[:, 4]) # shape [n_steps * batch, num_agents, H, W, C]
-        state_next = np.stack(batch[:, 5]) # shape [n_steps * batch, num_agents, H, W, C_share]
-        done = np.stack(batch[:, 6])
+        # Stack
+        obs = np.stack(obs_list, axis=0)            # (B_s, B_env, N, H, W, C)
+        share_obs = np.stack(share_list, axis=0)    # (B_s, B_env, N, H, W, C_share)
+        skills = np.stack(skills_list, axis=0)      # (B_s, B_env, N)
+        rewards = np.stack(reward_list, axis=0)     # (B_s, B_env)
+        obs_next = np.stack(obsn_list, axis=0)      # (B_s, B_env, N, H, W, C)
+        share_obs_next = np.stack(sharen_list, axis=0)
+        dones = np.stack(done_list, axis=0)         # (B_s, B_env)
 
-        # change them into tensors
+        B_s, B_env, N, H, W, C = obs.shape
+        B_total = B_s * B_env
+
+        # Flatten sample × env dims
+        obs = obs.reshape(B_total, N, H, W, C)
+        share_obs = share_obs.reshape(B_total, N, H, W, share_obs.shape[-1])
+        skills = skills.reshape(B_total, N)
+        rewards = rewards.reshape(B_total)
+        obs_next = obs_next.reshape(B_total, N, H, W, C)
+        share_obs_next = share_obs_next.reshape(B_total, N, H, W, share_obs_next.shape[-1])
+        dones = dones.reshape(B_total)
+
+        # Convert to torch
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-        skills_t = torch.as_tensor(skills, dtype=torch.int64, device=self.device)
-        reward_t = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
+        share_obs_t = torch.as_tensor(share_obs, dtype=torch.float32, device=self.device)
+        skills_t = torch.as_tensor(skills, dtype=torch.long, device=self.device)
+        rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         obs_next_t = torch.as_tensor(obs_next, dtype=torch.float32, device=self.device)
-        state_next_t = torch.as_tensor(state_next, dtype=torch.float32, device=self.device)
-        done_t = torch.as_tensor(done, dtype=torch.float32, device=self.device)
+        share_obs_next_t = torch.as_tensor(share_obs_next, dtype=torch.float32, device=self.device)
+        dones_t = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
 
-        # encode obs and state using encoder
-        obs_t = self.obs_encoder(obs_t) # change obs_t into shape [n_steps * batch, num_agents, obs_dim]
-        state_t = self.share_obs_encoder(state_t) # change state_t into shape [n_steps * batch, num_agents, state_dim]
-        obs_next_t = self.obs_encoder(obs_next_t) # change obs_next_t into shape [n_steps * batch, num_agents, obs_dim]
-        state_next_t = self.share_obs_encoder(state_next_t) # change state_next_t into shape [n_steps * batch, num_agents, state_dim]
+        # Encode
+        obs_enc = self.obs_encoder(obs_t)                      # (B_total, N, obs_dim)
+        share_enc = self.share_obs_encoder(share_obs_t)        # (B_total, N, state_dim)
+        obs_next_enc = self.obs_encoder(obs_next_t)
+        share_next_enc = self.share_obs_encoder(share_obs_next_t)
 
-        # change skills_t into one-hot (num_steps * batch, num_agents, num_skills)
-        skills_t = torch.nn.functional.one_hot(skills_t, num_classes=self.num_skills).float()
+        # QMIX mixer expects a single state vector per sample (not per-agent),
+        # so collapse the agent dimension of the shared encodings.
+        state_enc = share_enc.mean(dim=1)              # (B_total, state_dim)
+        state_next_enc = share_next_enc.mean(dim=1)    # (B_total, state_dim)
 
-        return batch.shape[0], state_t, obs_t, skills_t, reward_t, state_next_t, obs_next_t, done_t
+        # One-hot skills
+        skills_oh = F.one_hot(skills_t, num_classes=self.num_skills).float()
+
+        return (
+            B_total,
+            state_enc,        # state encoding for mixer
+            obs_enc,          # obs encoding for agent utility
+            skills_oh,
+            rewards_t,
+            state_next_enc,
+            obs_next_enc,
+            dones_t,
+        )
 
     def train_policy_high(self, batch):
-        # batch shape: npy list of [batch, share_obs_high, policy_obs_high, skills_int, rewards_high, share_obs, policy_obs, done]
-        
-        # process batch data 
-        n_steps, state, obs, skills_1hot, reward, state_next, obs_next, done = self.process_batch_high(batch)
+        # batch: np array of [obs_h, share_obs_h, current_skills, rewards_h, next_obs, next_share_obs, done_env]
+        (
+            n_samples,
+            state,
+            obs,
+            skills_1hot,
+            reward,
+            state_next,
+            obs_next,
+            done,
+        ) = self.process_batch_high(batch)
 
-        with torch.no_grad(): # one step TD
-            argmax_actions = torch.argmax(self.agent_target(obs_next), dim=2)  # shape: [B_total, num_agents]
-            # One-hot target skills per agent, matching agent_target output shape [B_total, num_agents, num_skills]
-            skills_target_1hot = torch.zeros(
-                (argmax_actions.shape[0], self.num_agents, self.num_skills), dtype=torch.float32, device=self.device
-            )
-            skills_target_1hot.scatter_(2, argmax_actions.unsqueeze(-1), 1.0)
+        # one-step TD for joint Q_tot
+        with torch.no_grad():
+            # target per-agent utilities for next obs
+            agent_q_next = self.agent_target(obs_next)  # (B, N, K)
 
-            q_target_selected = (self.agent_target(obs_next) * skills_target_1hot).sum(dim=2)
-            mixer_input_target = q_target_selected.view(-1, self.num_agents)
+            # greedy skills for target
+            argmax_actions = torch.argmax(agent_q_next, dim=2)  # (B, N)
+            skills_target_1hot = F.one_hot(
+                argmax_actions, num_classes=self.num_skills
+            ).float()  # (B, N, K)
 
-            state_next_t = torch.as_tensor(state_next, dtype=torch.float32, device=self.device)
-            q_tot_target = self.mixer_target(mixer_input_target, state_next_t).squeeze(1)
+            # Q values for chosen target skills
+            q_target_selected = (agent_q_next * skills_target_1hot).sum(dim=2)  # (B, N)
 
-            done_multiplier = -(torch.as_tensor(done, dtype=torch.float32, device=self.device) - 1.0)
-            target = torch.as_tensor(reward, dtype=torch.float32, device=self.device) + self.gamma * q_tot_target * done_multiplier
+            # Mixer expects (B, N) for agent Qs and state encoding
+            mixer_input_target = q_target_selected.view(-1, self.num_agents)  # (B, N)
+            q_tot_target = self.mixer_target(mixer_input_target, state_next).squeeze(1)  # (B,)
 
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        skills_1hot_t = torch.as_tensor(skills_1hot, dtype=torch.float32, device=self.device)
-        state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+            # done multiplier: 1 for non-terminal, 0 for terminal
+            done_multiplier = 1.0 - done  # (B,)
 
-        q_selected = (self.agent_main(obs_t) * skills_1hot_t).sum(dim=2)
-        mixer_input = q_selected.view(-1, self.num_agents)
-        q_tot = self.mixer_main(mixer_input, state_t).squeeze(1)
+            target = reward + self.gamma * q_tot_target * done_multiplier  # (B,)
+
+        # current Q_tot
+        agent_q = self.agent_main(obs)  # (B, N, K)
+        q_selected = (agent_q * skills_1hot).sum(dim=2)  # (B, N)
+        mixer_input = q_selected.view(-1, self.num_agents)  # (B, N)
+        q_tot = self.mixer_main(mixer_input, state).squeeze(1)  # (B,)
 
         loss = self.loss_fn(q_tot, target)
         self.high_opt.zero_grad()
@@ -413,63 +449,116 @@ class HMARLModel:
         networks.soft_update(self.agent_target, self.agent_main, self.tau)
         networks.soft_update(self.mixer_target, self.mixer_main, self.tau)
 
-    def process_batch_low(self, batch): # helper function for low-level policy training
-        # batch content: n_steps of [obs, actions, rewards_low, current_skills, next_obs, dones]
-        # shape of obs: [batch, num_agents, H, W, C]
-        # shape of actions: [batch, num_agents] (int action per agent)
-        # shape of rewards_low: [batch, num_agents]
-        # shape of skills_int: [batch, num_agents] (int skill per agent)
-        # shape of obs_next: [batch, num_agents, H, W, C]
-        # shape of done: [batch,] (episode termination flag 1 0)
+    def process_batch_low(self, batch):
+        """
+        batch: list of transitions, each transition = 
+            [obs, actions, rewards_low, skills, next_obs, done_env]
 
-        assert batch.shape[1] == 6, "Batch shape incorrect for low-level policy training."
+        Shapes per transition element:
+            obs:        (B_env, N, H, W, C)
+            actions:    (B_env, N)
+            rewards:    (B_env, N)
+            skills:     (B_env, N)
+            next_obs:   (B_env, N, H, W, C)
+            done_env:   (B_env,) or (B_env, N) or (B_env, N, 1)
 
-        # merge n_steps and batch dimensions
-        batch = np.asarray(batch) # shape [n_steps, batch, 6] where each i in [6] holds python obj
-        batch = batch.reshape(-1, batch.shape[2]) # shape [n_steps * batch, ...]
+        We convert to:
+            obs_enc:        (B_total, N, obs_dim)
+            actions_1hot:   (B_total, N, A)
+            rewards_t:      (B_total, N)
+            obs_next_enc:   (B_total, N, obs_dim)
+            skills_oh:      (B_total, N, K)
+            dones_t:        (B_total,)
+        where:
+            B_total = len(batch) * B_env
+        """
 
-        # organze batch data
-        obs = np.stack(batch[:, 0])
-        actions = np.stack(batch[:, 1])
-        rewards = np.stack(batch[:, 2])
-        skills = np.stack(batch[:, 3])
-        obs_next = np.stack(batch[:, 4])
-        done = np.stack(batch[:, 5])
+        # --- 1. Unzip transitions ---
+        obs_list, act_list, rew_list, skill_list, next_obs_list, done_list = zip(*batch)
 
-        # change them into tensors
+        # --- 2. Stack each field ---
+        obs = np.stack(obs_list, axis=0)            # (B_s, B_env, N, H, W, C)
+        actions = np.stack(act_list, axis=0)        # (B_s, B_env, N)
+        rewards = np.stack(rew_list, axis=0)        # (B_s, B_env, N)
+        skills = np.stack(skill_list, axis=0)       # (B_s, B_env, N)
+        obs_next = np.stack(next_obs_list, axis=0)  # (B_s, B_env, N, H, W, C)
+        dones = np.stack(done_list, axis=0)         # (B_s, B_env, [N]...)
+
+        B_s, B_env, N, H, W, C = obs.shape
+        B_total = B_s * B_env
+
+        # --- 3. Flatten sample & env dims ---
+        obs = obs.reshape(B_total, N, H, W, C)
+        obs_next = obs_next.reshape(B_total, N, H, W, C)
+        actions = actions.reshape(B_total, N)
+        rewards = rewards.reshape(B_total, N)
+        skills = skills.reshape(B_total, N)
+
+        # --- 4. Normalize dones to (B_total,) ---
+        dones_arr = np.asarray(dones)
+        # Case: (B_s, B_env)
+        if dones_arr.ndim == 2:  # (B_s, B_env)
+            dones_flat = dones_arr.reshape(B_total)
+        else:
+            # Cases: (B_s, B_env, N) or (B_s, B_env, N, 1)
+            dones_flat = np.any(dones_arr.reshape(B_s, B_env, -1) > 0.5, axis=2)
+            dones_flat = dones_flat.reshape(B_total)
+
+        # --- 5. Convert to torch ---
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        obs_next_t = torch.as_tensor(obs_next, dtype=torch.float32, device=self.device)
         actions_t = torch.as_tensor(actions, dtype=torch.int64, device=self.device)
         rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         skills_t = torch.as_tensor(skills, dtype=torch.int64, device=self.device)
-        obs_next_t = torch.as_tensor(obs_next, dtype=torch.float32, device=self.device)
-        done_t = torch.as_tensor(done, dtype=torch.float32, device=self.device)
+        dones_t = torch.as_tensor(dones_flat, dtype=torch.float32, device=self.device)
 
-        # encode obs using encoder
-        obs_t = self.obs_encoder(obs_t) # change obs_t into shape [n_steps * batch, num_agents, obs_dim]
-        obs_next_t = self.obs_encoder(obs_next_t) # change obs_next_t into shape [n_steps * batch, num_agents, obs_dim]
+        # --- 6. Encode obs ---
+        obs_enc = self.obs_encoder(obs_t)           # (B_total, N, obs_dim)
+        obs_next_enc = self.obs_encoder(obs_next_t) # (B_total, N, obs_dim)
 
-        # change skills_t into one-hot (num_steps * batch, num_agents, num_skills)
-        skills_t = torch.nn.functional.one_hot(skills_t, num_classes=self.num_skills).float()
+        # --- 7. One-hot encodings ---
+        skills_oh = F.one_hot(skills_t, num_classes=self.num_skills).float()
+        actions_1hot = F.one_hot(actions_t, num_classes=self.num_actions).float()
 
-        # change actions_t into one-hot (num_steps * batch, num_agents, num_actions)
-        actions_1hot = torch.nn.functional.one_hot(actions_t, num_classes=self.num_actions).float()
-
-        return batch.shape[0], obs_t, actions_1hot, rewards_t, obs_next_t, skills_t, done_t
+        return (
+            B_total,
+            obs_enc,
+            actions_1hot,
+            rewards_t,
+            obs_next_enc,
+            skills_oh,
+            dones_t,
+        )
 
     def train_policy_low(self, batch):
-        # batch shape: npy list of [policy_obs, actions_int, rewards_low, skills_int, policy_obs_next, done])
+        # batch: np array of [obs, actions_int, rewards_low, skills_int, obs_next, done_env]
+        (
+            n_samples,
+            obs,
+            actions_1hot,
+            rewards,
+            obs_next,
+            skills,
+            done,
+        ) = self.process_batch_low(batch)
 
-        # process batch data
-        n_steps, obs, actions_1hot, rewards, obs_next, skills, done = self.process_batch_low(batch)
-        
-        # train low-level Q-function
-        with torch.no_grad(): # one step TD
-            q_target = self.Q_low_target(obs_next, skills)
-            done_multiplier = -(torch.as_tensor(done, dtype=torch.float32, device=self.device) - 1.0) # if done, future value contribution is zero
-            target = torch.as_tensor(rewards, dtype=torch.float32, device=self.device) \
-                     + self.gamma * torch.max(q_target, dim=2)[0] * done_multiplier
-        q_selected = (self.Q_low(obs, skills) * actions_1hot).sum(dim=2)
-    
+        B = obs.shape[0]
+
+        # one-step TD for low-level Q
+        with torch.no_grad():
+            q_target_all = self.Q_low_target(obs_next, skills)  # (B, N, A)
+            q_target_max = q_target_all.max(dim=2)[0]  # (B, N)
+
+            # done is per-env; expand to per-agent
+            done_expanded = done.view(B, 1)  # (B, 1)
+            done_expanded = done_expanded.expand_as(q_target_max)  # (B, N)
+            done_mult = 1.0 - done_expanded
+
+            target = rewards + self.gamma * q_target_max * done_mult  # (B, N)
+
+        q_all = self.Q_low(obs, skills)  # (B, N, A)
+        q_selected = (q_all * actions_1hot).sum(dim=2)  # (B, N)
+
         loss = self.loss_fn(q_selected, target)
         self.low_opt.zero_grad()
         loss.backward()
@@ -477,13 +566,16 @@ class HMARLModel:
 
         networks.soft_update(self.Q_low_target, self.Q_low, self.tau)
 
-    def _downsample_traj(self, obs): # helper function for decoder (shape of obs: [batch, traj_length, obs_dim])
+    def _downsample_traj(self, obs):
+        """Helper for decoder (obs shape: [B, T, obs_dim])."""
         obs_downsampled = obs[:, :: self.traj_skip, :]
         if self.obs_truncate_length:
             obs_downsampled = obs_downsampled[:, :, : self.obs_truncate_length]
         if self.use_state_difference:
             obs_downsampled = obs_downsampled[:, 1:, :] - obs_downsampled[:, :-1, :]
-        assert obs_downsampled.shape[1] == self.traj_length_downsampled
+        assert (
+            obs_downsampled.shape[1] == self.traj_length_downsampled
+        ), f"Downsampled traj length {obs_downsampled.shape[1]} != expected {self.traj_length_downsampled}"
         return obs_downsampled
 
     def train_decoder(self, dataset):
@@ -493,60 +585,39 @@ class HMARLModel:
             skill_id: scalar int
         """
 
-        # ----------------------------------------------------
-        # 1. Separate trajectories and skill ids
-        # ----------------------------------------------------
-        traj_list  = [item[0] for item in dataset]  # variable-length (T_i, H, W, C)
+        traj_list = [item[0] for item in dataset]
         skill_list = [item[1] for item in dataset]
 
         B = len(traj_list)
-        T_target = self.steps_per_assign       # <-- padding target
-        _, H, W, C = traj_list[0].shape        # shape from first element
+        if B == 0:
+            return 0.0
 
-        # ----------------------------------------------------
-        # 2. Create padded trajectory array of fixed length
-        # ----------------------------------------------------
+        T_target = self.steps_per_assign
+        _, H, W, C = traj_list[0].shape
+
         padded_traj = np.zeros((B, T_target, H, W, C), dtype=np.float32)
-
         for i, traj in enumerate(traj_list):
             T_i = traj.shape[0]
-
             if T_i >= T_target:
-                padded_traj[i] = traj[:T_target]        # truncate if too long
+                padded_traj[i] = traj[:T_target]
             else:
-                padded_traj[i, :T_i] = traj             # pad rest with zeros
+                padded_traj[i, :T_i] = traj
 
-        traj_np  = padded_traj                          # (B, T_target, H, W, C)
+        traj_np = padded_traj  # (B, T_target, H, W, C)
         skill_np = np.asarray(skill_list, dtype=np.int64)
 
-        # print(f"[Decoder] padded traj shape: {traj_np.shape}")
-        # print(f"[Decoder] skills shape: {skill_np.shape}")
-
-        # ----------------------------------------------------
-        # 3. Convert to tensor
-        # ----------------------------------------------------
         traj_t = torch.as_tensor(traj_np, dtype=torch.float32, device=self.device)
         skills_t = torch.as_tensor(skill_np, dtype=torch.long, device=self.device)
 
-        # ----------------------------------------------------
-        # 4. Encode obs frame-wise (flatten -> encode -> reshape)
-        # ----------------------------------------------------
         B, T, _, _, _ = traj_np.shape
         traj_flat = traj_t.reshape(B * T, H, W, C)
 
         with torch.no_grad():
-            obs_flat = self.obs_encoder(traj_flat)     # (B*T, obs_dim)
+            obs_flat = self.obs_encoder(traj_flat)  # (B*T, obs_dim)
 
-        obs_seq = obs_flat.reshape(B, T, -1)           # (B, T, obs_dim)
-
-        # ----------------------------------------------------
-        # 5. Downsample (handles fixed T properly)
-        # ----------------------------------------------------
+        obs_seq = obs_flat.reshape(B, T, -1)  # (B, T, obs_dim)
         traj_down = self._downsample_traj(obs_seq)
 
-        # ----------------------------------------------------
-        # 6. Decoder forward & train
-        # ----------------------------------------------------
         logits, probs = self.decoder(traj_down)
         loss = self.ce_loss(logits, skills_t)
 
@@ -554,22 +625,19 @@ class HMARLModel:
         loss.backward()
         self.decoder_opt.step()
 
-        # ----------------------------------------------------
-        # 7. Expected probability
-        # ----------------------------------------------------
         with torch.no_grad():
             expected_prob = probs.gather(1, skills_t.unsqueeze(1)).mean().item()
 
         return expected_prob
 
-    def use_decoder(obs): 
+    def use_decoder(obs):
         """
         Compute decoder output given trajectory observations.
-        input: 
+        input:
             [batch_size(=rollout_threads), num_agents, period of high policy, H, W, C]
-        output: 
+        output:
             [batch_size, num_agents, num_skills]
-        
+
         """
         pass
 
@@ -577,17 +645,13 @@ class HMARLModel:
         """
         Compute decoder-based intrinsic reward:
         input:
-            agents_traj_obs: list/np.ndarray of shape
-                (B = rollout_threads * num_agents or any batch size, T, H, W, C)
+            agents_traj_obs: np.ndarray of shape (B, T, H, W, C)
             skills: shape (B,), skill index for each agent-trajectory
 
         output:
             reward: (B,) numpy array
         """
 
-        # ---------------------------------------
-        # 1) Convert trajectory to numpy & check shapes
-        # ---------------------------------------
         traj_np = np.asarray(agents_traj_obs)
         if traj_np.ndim != 5:
             raise ValueError(
@@ -595,51 +659,38 @@ class HMARLModel:
             )
 
         B, T, H, W, C = traj_np.shape
-        # print(f"DEBUG traj_np: {traj_np.shape}")
 
-        # ---------------------------------------
-        # 2) Encode observations: reshape time into batch
-        # ---------------------------------------
         traj_flat = traj_np.reshape(B * T, H, W, C)
-        traj_flat = torch.as_tensor(traj_flat, dtype=torch.float32, device=self.device)
+        traj_flat_t = torch.as_tensor(
+            traj_flat, dtype=torch.float32, device=self.device
+        )
 
         with torch.no_grad():
-            obs_encoded = self.obs_encoder(traj_flat)   # shape (B*T, obs_dim)
+            obs_encoded = self.obs_encoder(traj_flat_t)  # (B*T, obs_dim)
 
-        obs_encoded = obs_encoded.reshape(B, T, -1)     # (B, T, obs_dim)
-        # print("DEBUG encoded shape:", obs_encoded.shape)
+        obs_encoded = obs_encoded.reshape(B, T, -1)  # (B, T, obs_dim)
 
-        # ---------------------------------------
-        # 3) Downsample trajectory
-        # ---------------------------------------
         traj_down = self._downsample_traj(obs_encoded)
-        # expected output: (B, T_down, obs_dim)
 
-        # ---------------------------------------
-        # 4) Decoder → skill probability
-        # ---------------------------------------
-        skills = torch.as_tensor(skills, dtype=torch.long, device=self.device)  # (B,)
+        skills_t = torch.as_tensor(skills, dtype=torch.long, device=self.device)
         with torch.no_grad():
-            _, decoder_probs = self.decoder(traj_down)  # (B, N_skills)
-
-            # simplest: pick p(skill_i | trajectory_i)
-            prob = decoder_probs[torch.arange(B), skills]  # (B,)
+            _, decoder_probs = self.decoder(traj_down)  # (B, num_skills)
+            prob = decoder_probs[torch.arange(B), skills_t]  # (B,)
 
         return prob.cpu().numpy()
-    
+
     @torch.no_grad()
     def reset(self):
-        """Reset internal step counter, called at beginning of each episode or eval, render modes. """
+        """Reset internal step counter, called at beginning of each episode or eval."""
         self.step = 0
 
     @staticmethod
     def _format_actions(actions: np.ndarray) -> np.ndarray:
         """
         Ensure actions always have shape (..., num_agents, 1) so env's _action_convertor
-        receives indexable entries. So we add a dummy last dimension .
+        receives indexable entries. So we add a dummy last dimension.
         """
-        actions = np.expand_dims(actions, axis=-1)
-        return actions
+        return np.expand_dims(actions, axis=-1)
 
     def save(self, path):
         print("saving to", path)
@@ -675,12 +726,16 @@ class HMARLModel:
         self.Q_low.eval()
         self.agent_main.eval()
         self.mixer_main.eval()
+        self.obs_encoder.eval()
+        self.share_obs_encoder.eval()
 
         # reset internal skill storage
         self.reset()
-    
+
     def prep_training(self):
         self.decoder.train()
         self.Q_low.train()
         self.agent_main.train()
         self.mixer_main.train()
+        self.obs_encoder.train()
+        self.share_obs_encoder.train()

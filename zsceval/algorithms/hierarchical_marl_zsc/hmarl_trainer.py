@@ -13,6 +13,7 @@ from zsceval.runner.shared.overcooked_runner import OvercookedRunner
 from zsceval.algorithms.hierarchical_marl_zsc.hmarl_policy import HMARLModel
 from zsceval.algorithms.hierarchical_marl_zsc.utils.replay_buffer import Replay_Buffer
 
+
 # Trainer Class Compatible with ZSC-Eval
 # In training, it is wrapped with simplest runner which not compatible with base_runner
 # After training, it provides functions other policies can use (decoder, assign_skills, get_actions, ...)
@@ -21,7 +22,6 @@ class HMARLTrainer(OvercookedRunner):
     """Wrapper to bridge ZSC env messaging with HMARL policy/trainer."""
 
     def __init__(self, config, device=torch.device("cpu")):
-
 
         # Extract structured configs
         cfg_tr = config["trainer"]
@@ -47,7 +47,9 @@ class HMARLTrainer(OvercookedRunner):
         self.epsilon_end = cfg_tr["epsilon_end"]
         self.epsilon_div = cfg_tr["epsilon_div"]
         self.epsilon = self.epsilon_start
-        self.epsilon_step = (self.epsilon_start - self.epsilon_end) / float(self.epsilon_div)
+        self.epsilon_step = (self.epsilon_start - self.epsilon_end) / float(
+            self.epsilon_div
+        )
 
         # Reward mixing parameters
         self.alpha = cfg_tr["alpha_start"]
@@ -60,14 +62,14 @@ class HMARLTrainer(OvercookedRunner):
         self.steps_per_assign = cfg_tr["steps_per_assign"]
         self.decoder_training_threshold = cfg_tr["decoder_training_threshold"]
 
-        # Load model parameters (cleaned and grouped)
+        # Load model parameters
         state_dim = cfg_m["state_dim"]
         num_actions = cfg_m["num_actions"]
         obs_dim = cfg_m["obs_dim"]
         self.num_agents = cfg_m["num_agents"]
         self.num_actions = cfg_m["num_actions"]
 
-        # ---- Build HMARL Policy (unchanged logic) ----
+        # ---- Build HMARL Policy ----
         self.hsd = HMARLModel(cfg_m, device=device)
 
         # ---- Replay buffers ----
@@ -75,8 +77,6 @@ class HMARLTrainer(OvercookedRunner):
         self.buf_low = Replay_Buffer(size=self.buffer_size)
 
         # ---- Internal variables ----
-        # Note: batch_size from config is only a default; we re-sync shapes at runtime when inputs carry a different leading batch.
-
         self.current_skills = np.zeros((self.batch_size, self.num_agents), dtype=int)
         self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
 
@@ -89,39 +89,42 @@ class HMARLTrainer(OvercookedRunner):
         self.dataset = []
         self.obs_h = None
         self.share_obs_h = None
-        self.rewards_high = np.zeros((self.batch_size, self.num_agents), dtype=float)
-        # Track aggregated high-level rewards per skill for logging (rewards_high gets reset each period)
-        self.episode_high_level_rewards = []
-        # Global env step tracker to gate pretraining / updates (episode step counter is too small)
-        self.total_env_steps = 0
-        self.next_train_step = self.steps_per_train
 
-    ## --- Core functions that is run only in shared overcookedhmarl runner (overcooked_runner_hmarl.py) --- ##
+        # High-level cumulative reward per env (scalar, not per-agent)
+        self.rewards_high = np.zeros((self.batch_size,), dtype=float)
+
+        # Track aggregated high-level rewards per skill for logging
+        self.episode_high_level_rewards = []
+
+        # Global env step tracker
+        self.total_env_steps = 0
+
+        # First training step happens after pretrain_episodes env steps
+        self.next_train_step = self.pretrain_episodes
+
+    ## --- Core functions that is run only in shared overcooked HMARL runner --- ##
 
     # Update Q_low, Q_high, decoder based on internal buffer and counter using internals
-    def training_step(self, _unused: int = 0): 
+    def training_step(self, _unused: int = 0):
         # Set training mode for policy
         self.prep_training()
-
-        # Align update schedule so we do not skip pending multiples of steps_per_train
-        if self.total_env_steps >= self.pretrain_episodes and self.next_train_step < self.pretrain_episodes:
-            self.next_train_step = self.pretrain_episodes
 
         updates_done = 0
         expected_prob = None
 
+        # Perform as many updates as needed to catch up with env steps
         while self.total_env_steps >= self.next_train_step:
-            # LOW LEVEL UPDATE (frequent)
             if self.total_env_steps >= self.pretrain_episodes:
+                # Low-level update
                 batch_low = self.buf_low.sample_batch(self.batch_size)
                 self.hsd.train_policy_low(batch_low)
 
-                # HIGH LEVEL UPDATE (slow)
+                # High-level update
                 batch_high = self.buf_high.sample_batch(self.batch_size)
                 self.hsd.train_policy_high(batch_high)
                 updates_done += 1
 
-                # Decoder update (may run multiple times if dataset large)
+                # Decoder update if dataset is large enough
                 if len(self.dataset) >= self.decoder_training_threshold:
                     expected_prob = self.hsd.train_decoder(self.dataset)
                     self.dataset = []
@@ -130,10 +133,15 @@ class HMARLTrainer(OvercookedRunner):
 
         # --- EPSILON / ALPHA SCHEDULE ---
         if updates_done > 0 and self.total_env_steps >= self.pretrain_episodes:
-            self.epsilon = max(self.epsilon_end, self.epsilon - self.epsilon_step * updates_done)
+            self.epsilon = max(
+                self.epsilon_end, self.epsilon - self.epsilon_step * updates_done
+            )
 
         if self.alpha < self.alpha_threshold and updates_done > 0:
-            self.alpha = min(self.alpha_threshold, self.alpha + self.alpha_step * updates_done)
+            self.alpha = min(
+                self.alpha_threshold,
+                self.alpha + self.alpha_step * updates_done,
+            )
 
         # Snapshot the high-level rewards collected over skill periods within the episode
         if self.episode_high_level_rewards:
@@ -154,26 +162,20 @@ class HMARLTrainer(OvercookedRunner):
 
         flat_skills = self.current_skills.flatten()
         counts = np.bincount(flat_skills, minlength=self.N_skills)
-        train_infos["skill_usage"] = (counts / counts.sum()).tolist()
+        if counts.sum() > 0:
+            train_infos["skill_usage"] = (counts / counts.sum()).tolist()
+        else:
+            train_infos["skill_usage"] = [0.0 for _ in range(self.N_skills)]
 
         return train_infos
 
     # Update buffer and accumulated high level rewards based on environment step
     @torch.no_grad()
-    def update_buffer(self, steps, obs, share_obs, actions, rewards, next_obs, next_share_obs, dones):
-        # steps: step within episode                
-        # info 딕셔너리 key : 
-            # "all_agent_obs" : np.array of shape (n_rollout_threads, num_agents, H, W, C)
-            # "share_obs" : np.array of shape (n_rollout_threads, num_agents, H, W, C_share)
-            # "available_actions" : np.array of shape (n_rollout_threads, num_agents, num_actions)
-            # "rewards": np.array of shape (n_rollout_threads, num_agents, 1)
-            # "bad_transition" : bool - whether the transition is a bad transition
-            # "episode" : dict - episode information
-            # "sparse_reward_by_agent" : list of float - sparse reward of the episode by agent - x
-            # "shaped_reward_by_agent" : list of float - shaped reward of the episode by agent - x
-            # "stuck": list of list of bool - whether the agent is stuck
-        
-        # Infer effective batch size from obs shape (if no rollout dim, treat as single env with batch_size=0).
+    def update_buffer(
+        self, steps, obs, share_obs, actions, rewards, next_obs, next_share_obs, dones
+    ):
+        # steps: step within episode
+
         # ---------------------------------------------------
         # 1) Batch size sanity check
         # ---------------------------------------------------
@@ -186,8 +188,7 @@ class HMARLTrainer(OvercookedRunner):
             )
 
         # ---------------------------------------------------
-        # 2) Normalize rewards shape: remove dummy last dim
-        #    Expect final shape: (batch_size, num_agents)
+        # 2) Normalize rewards shape: expect (batch_size, num_agents)
         # ---------------------------------------------------
         rewards = np.asarray(rewards)
         if rewards.ndim == 3 and rewards.shape[-1] == 1:
@@ -200,21 +201,37 @@ class HMARLTrainer(OvercookedRunner):
             )
 
         # ---------------------------------------------------
-        # 3) Initialize intrinsic rewards (same shape as rewards)
+        # 3) Normalize dones: env-level done flag per rollout
+        # ---------------------------------------------------
+        dones = np.asarray(dones)
+        # common format: (batch, num_agents, 1) with same value for all agents
+        if dones.ndim == 3 and dones.shape[-1] == 1:
+            dones = dones.squeeze(-1)  # (batch, agents)
+        if dones.ndim == 2:
+            # env done if any agent is done
+            dones_env = np.any(dones > 0.5, axis=1).astype(np.float32)  # (batch,)
+        elif dones.ndim == 1:
+            dones_env = (dones > 0.5).astype(np.float32)
+        else:
+            raise ValueError(
+                f"[update_buffer] Unexpected dones shape: {dones.shape}"
+            )
+
+        # ---------------------------------------------------
+        # 4) Update per-agent sliding window trajectories (for decoder/IR)
+        #    Push current obs; deque(maxlen) will drop oldest automatically.
+        # ---------------------------------------------------
+        for b in range(self.batch_size):
+            for ag in range(self.num_agents):
+                self.traj_per_agent[b][ag].append(obs[b][ag])
+
+        # ---------------------------------------------------
+        # 5) Compute intrinsic rewards if enough history
         # ---------------------------------------------------
         self.intrinsic_rewards = np.zeros_like(rewards, dtype=np.float32)
 
-        # ---------------------------------------------------
-        # 4) Compute intrinsic rewards if enough history
-        #    Condition: 모든 agent가 최소 steps_per_assign 만큼 trajectory를 모았을 때
-        #    (deque maxlen 때문에, 길이가 부족하면 len < steps_per_assign)
-        # ---------------------------------------------------
-        # We check only when it's even possible:
-        # steps is 0-based, so after steps >= steps_per_assign-1 we can have full window.
         enough_steps = steps + 1 >= self.steps_per_assign
-
         if enough_steps:
-            # Check that every deque actually has enough entries
             all_ready = all(
                 len(self.traj_per_agent[b][ag]) == self.steps_per_assign
                 for b in range(self.batch_size)
@@ -222,18 +239,16 @@ class HMARLTrainer(OvercookedRunner):
             )
 
             if all_ready:
-                # Flatten (batch, agents) -> (batch * agents)
                 traj_flat = np.array(
                     [
-                        list(self.traj_per_agent[b][ag])  # deque -> list
+                        list(self.traj_per_agent[b][ag])
                         for b in range(self.batch_size)
                         for ag in range(self.num_agents)
                     ]
-                )  # shape: (batch * agents, steps_per_assign, ...)
+                )  # (batch * agents, steps_per_assign, H, W, C)
 
                 skills_flat = self.current_skills.reshape(-1)  # (batch * agents,)
 
-                # hsd.compute_intrinsic_reward should return (batch * agents,)
                 ir_flat = self.hsd.compute_intrinsic_reward(traj_flat, skills_flat)
                 ir_flat = np.asarray(ir_flat)
 
@@ -246,38 +261,30 @@ class HMARLTrainer(OvercookedRunner):
                 self.intrinsic_rewards = ir_flat.reshape(
                     self.batch_size, self.num_agents
                 )
-            else:
-                # 아직 history가 부족한 경우 intrinsic은 0 유지
-                pass
+
+        # Optional scaling of intrinsic reward
+        self.intrinsic_rewards *= 0.1
 
         # ---------------------------------------------------
-        # 4-1) Optional scaling of intrinsic reward strength
-        # ---------------------------------------------------
-        self.intrinsic_rewards *= 0.1  # reduce impact to 10%
-
-        # ---------------------------------------------------
-        # 5) Low-level reward: mix extrinsic & intrinsic
-        #    rewards_low = alpha * env + (1 - alpha) * intrinsic
+        # 6) Low-level reward: mix extrinsic & intrinsic
         # ---------------------------------------------------
         rewards_low = self.alpha * rewards + (1.0 - self.alpha) * self.intrinsic_rewards
 
         # ---------------------------------------------------
-        # 6) Insert transition into low-level buffer
+        # 7) Insert transition into low-level buffer
+        #     done stored as env-level scalar per rollout
         # ---------------------------------------------------
-        self.buf_low.add(
-            [obs, actions, rewards_low, self.current_skills, next_obs, dones]
-        )
+        self.buf_low.add([obs, actions, rewards_low, self.current_skills, next_obs, dones_env])
 
         # ---------------------------------------------------
-        # 7) Update cumulative high-level rewards
-        #    Each skill period acts like "one step" in high-level MDP.
+        # 8) Update cumulative high-level rewards (macro-step reward)
+        #     Use scalar env reward per rollout (average over agents).
         # ---------------------------------------------------
-        discounted = self.hsd.gamma ** self.steps_per_assign
-        self.rewards_high += rewards * discounted  # shape-wise OK (batch, agents)
+        global_rewards = rewards.mean(axis=1)  # (batch,)
+        self.rewards_high += global_rewards
 
         # ---------------------------------------------------
-        # 8) End of one skill period? -> push high-level transition
-        #    Condition: (steps + 1) % steps_per_assign == 0 and not first step
+        # 9) End of one skill period? -> push high-level transition
         # ---------------------------------------------------
         is_end_of_skill = (steps + 1) % self.steps_per_assign == 0 and steps != 0
 
@@ -285,51 +292,40 @@ class HMARLTrainer(OvercookedRunner):
             # Cache aggregated reward for logging before it gets reset
             self.episode_high_level_rewards.append(float(np.mean(self.rewards_high)))
 
-            # 8-1) Add high-level transition to buffer
+            # High-level transition uses env-level reward and done
             self.buf_high.add(
                 [
                     self.obs_h,          # high-level state at skill start
-                    self.share_obs_h,    # shared state if any
+                    self.share_obs_h,    # shared state
                     self.current_skills, # high-level action (skills)
-                    self.rewards_high,   # accumulated discounted reward over this skill period
+                    self.rewards_high,   # accumulated reward over this skill period
                     next_obs,            # next high-level state
                     next_share_obs,
-                    dones,
+                    dones_env,           # env-level done per rollout
                 ]
             )
 
-            # 8-2) Append trajectories to decoder dataset
-            #      Each entry: (single-agent trajectory, skill id)
+            # Append trajectories to decoder dataset
             for b in range(self.batch_size):
                 for ag in range(self.num_agents):
-                    traj_slice = np.array(self.traj_per_agent[b][ag])  # length == steps_per_assign
+                    traj_slice = np.array(
+                        self.traj_per_agent[b][ag]
+                    )  # length == steps_per_assign
                     skill_id = self.current_skills[b][ag]
-                    # print("traj_slice.shape in update_buffer:", traj_slice.shape)
-                    # print("skill_id in update_buffer:", skill_id)
                     self.dataset.append([traj_slice, skill_id])
 
-            # 8-3) Reset only rewards_high, not traj_per_agent (deque keeps sliding window)
+            # Reset only rewards_high
             self.rewards_high = np.zeros_like(self.rewards_high, dtype=np.float32)
-
-            # Note: traj_per_agent is NOT reset. Deque keeps last steps_per_assign frames automatically.
-
-        # ---------------------------------------------------
-        # 9) Update per-agent sliding window trajectories
-        #    Always push current obs; deque(maxlen) will drop oldest automatically.
-        # ---------------------------------------------------
-        for b in range(self.batch_size):
-            for ag in range(self.num_agents):
-                self.traj_per_agent[b][ag].append(obs[b][ag])
 
         # ---------------------------------------------------
         # 10) Advance global step counter
         # ---------------------------------------------------
         self.total_env_steps += 1
 
-    # Fetch low level actions during training mode, 
-    # manages internal buffers, skill assignments, intrinsic rewards, high level rewards ... 
+    # Fetch low level actions during training mode,
+    # manages internal buffers, skill assignments, intrinsic rewards, high level rewards ...
     @torch.no_grad()
-    def get_actions_algorithm(self, steps, obs, share_obs, available_actions): # step within episode
+    def get_actions_algorithm(self, steps, obs, share_obs, available_actions):  # step within episode
         """
         Compute low-level actions for each agent given current skills.
         Handles:
@@ -337,7 +333,7 @@ class HMARLTrainer(OvercookedRunner):
         - low level action computation via HSD policy
         """
 
-        self.prep_rollout()   # eval mode
+        self.prep_rollout()  # eval mode
 
         # Start of a new episode; reset trackers that span a full episode
         if steps == 0:
@@ -356,17 +352,15 @@ class HMARLTrainer(OvercookedRunner):
         # ---------------------------------------
         # 2) Compute low-level actions from HSD policy
         # ---------------------------------------
-        # hsd.get_actions_algorithm returns shape (batch, agents, 1)
         raw_actions = self.hsd.get_actions_algorithm(
             steps,
             obs,
             share_obs,
             available_actions,
             self.epsilon,
-        )
+        )  # (batch, agents, 1)
 
-        # collapse dummy dim: (batch, agents, 1) → (batch, agents)
-        actions = raw_actions.squeeze(-1)
+        actions = raw_actions.squeeze(-1)  # (batch, agents)
 
         # ---------------------------------------
         # 3) Skill assignment at boundary
@@ -388,8 +382,7 @@ class HMARLTrainer(OvercookedRunner):
                 self.current_skills = np.copy(self.hsd.current_skills)
 
         # ---------------------------------------
-        # 4) Pretraining: override low-level actions ONLY during warmup
-        #    (random actions consistent with available_actions)
+        # 4) Pretraining: override low-level actions with random exploratory actions
         # ---------------------------------------
         if self.total_env_steps < self.pretrain_episodes:
             actions = np.zeros((self.batch_size, self.num_agents), dtype=np.int32)
@@ -414,10 +407,14 @@ class HMARLTrainer(OvercookedRunner):
         self.obs_h = None
         self.intrinsic_rewards = np.zeros((self.batch_size, self.num_agents))
         self.traj_per_agent = [
-            [[] for _ in range(self.num_agents)] for _ in range(self.batch_size)
+            [deque(maxlen=self.steps_per_assign) for _ in range(self.num_agents)]
+            for _ in range(self.batch_size)
         ]
-        self.rewards_high = np.zeros_like(self.current_skills)
+        self.rewards_high = np.zeros((self.batch_size,), dtype=float)
         self.dataset = []
+        self.episode_high_level_rewards = []
+        self.total_env_steps = 0
+        self.next_train_step = self.pretrain_episodes
 
     @torch.no_grad()
     def prep_rollout(self):
@@ -440,8 +437,7 @@ class HMARLTrainer(OvercookedRunner):
         Env expects each action entry to be indexable (a[0]); wrap scalar actions with a
         trailing singleton dimension.
         """
-        actions = np.expand_dims(actions, axis=-1)  # shape: (..., num_agents, 1)
-        return actions
+        return np.expand_dims(actions, axis=-1)  # (..., num_agents, 1)
 
 
 # Single-Agent Wrapper around HMARLTrainer

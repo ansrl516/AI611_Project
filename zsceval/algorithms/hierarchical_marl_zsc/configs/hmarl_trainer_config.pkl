@@ -10,7 +10,7 @@ config = {
         "buffer_size": 100000,
         "batch_size": 32,
         "pretrain_episodes": 5000,
-        "steps_per_train": 20,
+        "steps_per_train": 8,
 
         "epsilon_start": 1.0,
         "epsilon_end": 0.05,

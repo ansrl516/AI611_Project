@@ -49,7 +49,8 @@ do
     --cnn_layers_params "32,3,1,1 64,3,1,1 32,3,1,1" --use_recurrent_policy \
     --use_proper_time_limits \
     --save_interval 25 --log_interval 10 --use_eval --eval_interval 20 --n_eval_rollout_threads 10 \
-    --use_render --save_gifs --n_render_rollout_threads 1 --render_episodes 1 \
-    --cuda_device ${cuda_device} 
+    --use_render --n_render_rollout_threads 1 --render_episodes 1 \
+    --cuda_device ${cuda_device} \
+    # --save_gifs
     # --wandb_name "kyungyoon"
 done
