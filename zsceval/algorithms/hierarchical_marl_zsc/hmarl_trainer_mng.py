@@ -23,9 +23,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch.optim import Adam
+from loguru import logger
 
 from zsceval.algorithms.hierarchical_marl_zsc.hmarl_policy import HMARLModel
-from zsceval.algorithms.hierarchical_marl_zsc.utils.networks import ShareObsEncoder
+from zsceval.algorithms.hierarchical_marl_zsc.utils.networks import ShareObsEncoder, ObsEncoder
 
 
 def _to_tensor(x, device, dtype=torch.float32):
@@ -35,25 +36,25 @@ def _to_tensor(x, device, dtype=torch.float32):
 
 
 class _TrajEncoder(nn.Module):
-    """Encodes a window of shared observations using the same encoder + GRU."""
+    """Encodes a window of agent observations using the obs encoder + GRU."""
 
-    def __init__(self, share_obs_shape: Tuple[int, ...], hidden_dim: int = 128):
+    def __init__(self, obs_shape: Tuple[int, ...], hidden_dim: int = 128):
         super().__init__()
-        h, w, c = share_obs_shape
-        self.enc = ShareObsEncoder(in_channels=c, state_embedding_dim=hidden_dim, H=h, W=w)
+        h, w, c = obs_shape
+        self.enc = ObsEncoder(in_channels=c, obs_embedding_dim=hidden_dim, H=h, W=w)
         self.gru = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, batch_first=True)
         self.hidden_dim = hidden_dim
 
-    def forward(self, share_traj: torch.Tensor) -> torch.Tensor:
+    def forward(self, traj: torch.Tensor) -> torch.Tensor:
         """
-        share_traj: (B, T, H, W, C_share)
+        traj: (B, T, H, W, C_obs)
         returns: (B, hidden_dim)
         """
-        B, T, H, W, C = share_traj.shape
-        flat = share_traj.reshape(B * T, H, W, C)
+        B, T, H, W, C = traj.shape
+        flat = traj.reshape(B * T, H, W, C)
         enc = self.enc(flat)  # (B*T, hidden_dim)
         enc = enc.reshape(B, T, -1)
-        out, h = self.gru(enc)
+        _, h = self.gru(enc)
         return h[-1]  # (B, hidden_dim)
 
 
@@ -126,6 +127,7 @@ class ManagerTrainerSingle:
         cfg_m = config["model"]
 
         self.device = device
+        self.num_agents = cfg_m.get("num_agents", 1)
         self.num_skills = cfg_m["num_skills"]
         self.num_actions = cfg_m["num_actions"]
         self.steps_per_assign = cfg_m["steps_per_assign"]
@@ -146,9 +148,14 @@ class ManagerTrainerSingle:
             cfg_m["obs_width"],
             cfg_m["share_obs_channels"],
         )
-        self.traj_encoder = _TrajEncoder(share_shape, hidden_dim=cfg_tr.get("traj_hidden_dim", 128))
+        obs_shape = (
+            cfg_m["obs_height"],
+            cfg_m["obs_width"],
+            cfg_m["obs_channels"],
+        )
+        self.traj_encoder = _TrajEncoder(obs_shape, hidden_dim=cfg_tr.get("traj_hidden_dim", 128))
         traj_feat_dim = self.traj_encoder.hidden_dim
-        skill_est_dim = self.num_skills 
+        skill_est_dim = self.num_skills * 1 + 1
         self.manager = _ManagerNet(
             share_shape,
             self.num_skills,
@@ -156,6 +163,7 @@ class ManagerTrainerSingle:
             skill_est_dim=skill_est_dim,
             hidden_dim=cfg_tr.get("manager_hidden_dim", 256),
         )
+        self.traj_encoder.to(device)
         self.manager.to(device)
         self.optim = Adam(self.manager.parameters(), lr=self.lr)
 
@@ -197,7 +205,7 @@ class ManagerTrainerSingle:
 
         new_period = (steps % self.steps_per_assign == 0) or (self.current_skill is None)
 
-        self._traj_buffer.append(share_obs.copy())
+        self._traj_buffer.append(obs[:, 0].copy())
         if len(self._traj_buffer) > self.steps_per_assign:
             self._traj_buffer.pop(0)
 
@@ -218,10 +226,12 @@ class ManagerTrainerSingle:
             self._last_skill_est = skill_est.detach()
             self.period_reward = np.zeros((batch,), dtype=np.float32)
 
-        skills = np.expand_dims(self.current_skill, axis=1)  # (B, 1)
-        obs_exp = np.expand_dims(obs, axis=1)  # (B, 1, H, W, C)
-        avail_exp = np.expand_dims(available_actions, axis=1) if available_actions is not None else None
-        actions = self.hsd.get_actions_low(obs_exp, avail_exp, skills)  # (B, 1)
+        # Align with HMARLModel.get_actions_low expectations: obs (B, N, H, W, C), skills (B, N)
+        B, N = obs.shape[0], obs.shape[1]
+        skills = np.repeat(self.current_skill[:, None], N, axis=1)  # (B, N)
+        obs_exp = obs  # already (B, N, H, W, C)
+        avail_exp = available_actions  # (B, N, A)
+        actions = self.hsd.get_actions_low(obs_exp, avail_exp, skills)  # (B, N)
         return self._format_actions(actions)
 
     @staticmethod
@@ -236,6 +246,7 @@ class ManagerTrainerSingle:
         """
         r = np.asarray(rewards).squeeze()
         d = np.asarray(dones).squeeze()
+        # logger.info(f"[hmarl_trainer_mng][step {steps}] raw rewards: {r}")
         if r.ndim > 1:
             r = r[:, 0]
         if d.ndim > 1:
@@ -368,14 +379,14 @@ class ManagerTrainerSingle:
 
     def _encode_traj(self) -> torch.Tensor:
         """
-        Encode the last steps_per_assign shared observations into a trajectory feature.
+        Encode the last steps_per_assign ego observations into a trajectory feature.
         Pads with zeros if not enough history.
         """
         if not self._traj_buffer:
             batch = getattr(self, "period_reward", np.zeros((1,), dtype=np.float32)).shape[0]
             return torch.zeros(batch, self.traj_encoder.hidden_dim, device=self.device)
-        traj_np = np.stack(self._traj_buffer, axis=0)  # (T, B, H, W, C)
-        traj_np = np.transpose(traj_np, (1, 0, 2, 3, 4))  # (B, T, H, W, C)
+        traj_np = np.stack(self._traj_buffer, axis=0)  # (T, B, H, W, C_obs)
+        traj_np = np.transpose(traj_np, (1, 0, 2, 3, 4))  # (B, T, H, W, C_obs)
         B, T, H, W, C = traj_np.shape
         if T < self.steps_per_assign:
             pad = np.zeros((B, self.steps_per_assign - T, H, W, C), dtype=traj_np.dtype)
@@ -393,34 +404,33 @@ class ManagerTrainerSingle:
             batch = getattr(self, "period_reward", np.zeros((1,), dtype=np.float32)).shape[0]
             return torch.zeros(batch, self.num_skills, device=self.device)
 
-        # _traj_buffer: list length T of shared_obs (B, H, W, C_share).
-        # We do not have per-partner obs here, so we approximate using shared_obs and pool.
-        traj_np = np.stack(self._traj_buffer, axis=0)  # (T, B, H, W, C_share)
-        traj_np = np.transpose(traj_np, (1, 0, 2, 3, 4))  # (B, T, H, W, C_share)
+        # _traj_buffer: list length T of ego obs (B, H, W, C_obs).
+        # If partner observations are available in runner, extend this to (B, P, H, W, C_obs).
+        traj_np = np.stack(self._traj_buffer, axis=0)  # (T, B, H, W, C_obs)
+        traj_np = np.transpose(traj_np, (1, 0, 2, 3, 4))  # (B, T, H, W, C_obs)
         B, T, H, W, C = traj_np.shape
 
-        # Decoder expects (B*, T, H, W, C_obs); here we reuse shared obs channels.
-        traj_flat = traj_np.reshape(B * 1, T, H, W, C)
+        # Treat partners as a flattened dim; here we only have ego, so P=1. If you add partners, reshape accordingly.
+        P = 1
+        traj_flat = traj_np.reshape(B * P, T, H, W, C)
         traj_t = torch.as_tensor(traj_flat, dtype=torch.float32, device=self.device)
 
-        # Downsample and run decoder to get logits; mirror hmarl_policy Decoder usage.
         with torch.no_grad():
-            # Encode frames
             Bflat, Tflat, _, _, _ = traj_t.shape
             traj_frames = traj_t.reshape(Bflat * Tflat, H, W, C)
-            obs_encoded = self.hsd.obs_encoder(traj_frames)  # (Bflat*Tflat, obs_dim)
+            obs_encoded = self.hsd.obs_encoder(traj_frames) 
             obs_seq = obs_encoded.reshape(Bflat, Tflat, -1)
 
-            # Downsample trajectory as in _downsample_traj
             down = obs_seq[:, :: self.hsd.traj_skip, :]
             if self.hsd.obs_truncate_length:
                 down = down[:, :, : self.hsd.obs_truncate_length]
             if self.hsd.use_state_difference:
                 down = down[:, 1:, :] - down[:, :-1, :]
 
-            logits, probs = self.hsd.decoder(down)  # (Bflat, num_skills)
+            _, probs = self.hsd.decoder(down)  # (Bflat, num_skills)
 
-        probs = probs.reshape(B, 1, self.num_skills)  # treat as one "partner" stream
-        # Pool over partners (mean) to get (B, num_skills)
-        pooled = probs.mean(dim=1)
+        # Flatten partners into feature: (B, P*num_skills)
+        probs = probs.reshape(B, P * self.num_skills)
+        count_feat = torch.full((B, 1), float(P), device=self.device) / max(1.0, float(self.num_agents - 1))
+        pooled = torch.cat([probs, count_feat], dim=1)  # (B, P*num_skills + 1)
         return pooled
