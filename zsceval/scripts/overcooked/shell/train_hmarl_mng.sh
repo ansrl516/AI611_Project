@@ -40,7 +40,7 @@ echo "Using CUDA device: ${cuda_device}"
 for seed in $(seq ${seed_begin} ${seed_max});
 do
     echo "seed is ${seed}:"
-    python ../train/train_hmarl.py --env_name ${env} --algorithm_name ${algo} --experiment_name ${exp} --layout_name ${layout} --num_agents ${num_agents} \
+    python ../train/train_hmarl_mng_ihyun.py --env_name ${env} --algorithm_name ${algo} --experiment_name ${exp} --layout_name ${layout} --num_agents ${num_agents} \
     --agent_policy_names ppo ppo \
     --seed ${seed} --n_training_threads 1 --n_rollout_threads 40 --dummy_batch_size 2 --num_mini_batch 1 --episode_length 400 --num_env_steps ${num_env_steps} --reward_shaping_horizon ${reward_shaping_horizon} \
     --overcooked_version ${version} \
