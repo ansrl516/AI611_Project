@@ -5,11 +5,18 @@
 #!/usr/bin/env python
 import argparse
 import os
-os.chdir("/workspace") # Set working directory to the project root
-import pprint
-import socket
 import sys
 from pathlib import Path
+
+# Ensure repo root is on sys.path and set CWD accordingly
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+os.chdir(str(REPO_ROOT))
+print(f"[train_hmarl] Working directory set to: {os.getcwd()}")
+
+import pprint
+import socket
 
 import setproctitle
 import torch
@@ -195,7 +202,7 @@ def main(args):
     }
 
     # run experiments with hmarl using our custom runner
-    from zsceval.runner.shared.overcooked_runner_hmarl import OvercookedRunnerHMARL as Runner
+    from zsceval.runner.shared.overcooked_runner_hmarl_mng import OvercookedRunnerHMARL_mng as Runner
     runner = Runner(config)
     runner.run()
     envs.close()
