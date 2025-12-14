@@ -20,8 +20,6 @@ config = {
         "alpha_end": 0.5,
         "alpha_step": 0.0005,
         "alpha_threshold": 0.6,
-
-        "N_skills": 4,
         "steps_per_assign": 8,
         "decoder_training_threshold": 256,
     },
@@ -36,7 +34,7 @@ config = {
 
         "num_agents": 2,
         "num_actions": 6,
-        "num_skills": 4,
+        "num_skills": 1,
         "state_dim": 64,
         "obs_dim": 64,
 

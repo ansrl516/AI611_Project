@@ -560,15 +560,21 @@ class HMARLModel:
 
         # one-step TD for low-level Q
         with torch.no_grad():
+            # Double Q: online net selects, target net evaluates
+            q_next_online = self.Q_low(obs_next, skills)  # (B, N, A)
+            next_actions = torch.argmax(q_next_online, dim=2, keepdim=True)  # (B, N, 1)
+
             q_target_all = self.Q_low_target(obs_next, skills)  # (B, N, A)
-            q_target_max = q_target_all.max(dim=2)[0]  # (B, N)
+            q_target_selected = torch.gather(
+                q_target_all, 2, next_actions
+            ).squeeze(2)  # (B, N)
 
             # done is per-env; expand to per-agent
             done_expanded = done.view(B, 1)  # (B, 1)
-            done_expanded = done_expanded.expand_as(q_target_max)  # (B, N)
+            done_expanded = done_expanded.expand_as(q_target_selected)  # (B, N)
             done_mult = 1.0 - done_expanded
 
-            target = rewards + self.gamma * q_target_max * done_mult  # (B, N)
+            target = rewards + self.gamma * q_target_selected * done_mult  # (B, N)
 
         q_all = self.Q_low(obs, skills)  # (B, N, A)
         q_selected = (q_all * actions_1hot).sum(dim=2)  # (B, N)

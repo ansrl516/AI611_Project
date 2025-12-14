@@ -235,11 +235,35 @@ class QmixSingle(nn.Module):
 
 
 class QLow(nn.Module):
+    """
+    Dueling + FiLM-conditioned low-level Q with optional batch support.
+    Keeps the same API but adds a richer feature path and double-Q friendly head.
+    """
+
     def __init__(self, obs_dim, role_dim, n_h1, n_h2, n_actions):
         super().__init__()
-        self.fc1 = nn.Linear(obs_dim + role_dim, n_h1)
+        # FiLM conditioning on skill/role embedding
+        self.film_scale = nn.Linear(role_dim, obs_dim)
+        self.film_shift = nn.Linear(role_dim, obs_dim)
+
+        # Shared torso
+        self.fc1 = nn.Linear(obs_dim, n_h1)
         self.fc2 = nn.Linear(n_h1, n_h2)
-        self.out = nn.Linear(n_h2, n_actions)
+        self.norm1 = nn.LayerNorm(n_h1)
+        self.norm2 = nn.LayerNorm(n_h2)
+
+        # Dueling heads
+        self.val_head = nn.Sequential(
+            nn.Linear(n_h2, n_h2),
+            nn.ReLU(),
+            nn.Linear(n_h2, 1),
+        )
+        self.adv_head = nn.Sequential(
+            nn.Linear(n_h2, n_h2),
+            nn.ReLU(),
+            nn.Linear(n_h2, n_actions),
+        )
+
         self.apply(_init_layer)
 
     def forward(self, obs, role):
@@ -250,23 +274,33 @@ class QLow(nn.Module):
 
         if obs.dim() == 2:
             # (N, D_obs), (N, D_role)
-            x = torch.cat([obs, role], dim=1)
-            x = F.relu(self.fc1(x))
-            x = F.relu(self.fc2(x))
-            return self.out(x)
+            film_s = self.film_scale(role)
+            film_b = self.film_shift(role)
+            x = obs * (1 + torch.tanh(film_s)) + film_b
+            x = self.norm1(F.relu(self.fc1(x)))
+            x = self.norm2(F.relu(self.fc2(x)))
+            v = self.val_head(x)
+            a = self.adv_head(x)
+            q = v + (a - a.mean(dim=1, keepdim=True))
+            return q
 
         elif obs.dim() == 3:
             # (B, N, D_obs), (B, N, D_role)
             B, N, D_obs = obs.shape
             _, _, D_role = role.shape
 
-            x = torch.cat([obs, role], dim=2)  # (B, N, D_obs+D_role)
-            x = x.reshape(B * N, D_obs + D_role)
-            x = F.relu(self.fc1(x))
-            x = F.relu(self.fc2(x))
-            x = self.out(x)
+            obs_flat = obs.reshape(B * N, D_obs)
+            role_flat = role.reshape(B * N, D_role)
 
-            return x.reshape(B, N, -1)
+            film_s = self.film_scale(role_flat)
+            film_b = self.film_shift(role_flat)
+            x = obs_flat * (1 + torch.tanh(film_s)) + film_b
+            x = self.norm1(F.relu(self.fc1(x)))
+            x = self.norm2(F.relu(self.fc2(x)))
+            v = self.val_head(x)
+            a = self.adv_head(x)
+            q = v + (a - a.mean(dim=1, keepdim=True))
+            return q.reshape(B, N, -1)
 
         else:
             raise ValueError(f"Unsupported obs/role shape {obs.shape}")
