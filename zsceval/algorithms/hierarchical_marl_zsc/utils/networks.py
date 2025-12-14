@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 # Changed: All of the networks below now support both single-agent and batched multi-agent inputs.
 
+
 def _init_layer(layer):
     """Small helper to mirror the narrow TF initialization that was used."""
     if isinstance(layer, nn.Linear):
@@ -11,11 +12,16 @@ def _init_layer(layer):
         if layer.bias is not None:
             nn.init.constant_(layer.bias, 0.0)
 
-class ObsEncoder(nn.Module):
+
+# Version1 ObsEncoder and ShareObsEncoder with batch support
+
+
+class ObsEncoder1(nn.Module):
     """
     Option1: torch.tensor of shape (num_agents, H, W, C) -> (num_agents, obs_dim)
     Option2: torch.tensor of shape (n_rollout_threads, num_agents, C, H, W) -> (n_rollout_threads, num_agents, obs_dim)
     """
+
     def __init__(self, in_channels, obs_embedding_dim=128, H=5, W=5):
         super().__init__()
 
@@ -80,11 +86,12 @@ class ObsEncoder(nn.Module):
             )
 
 
-class ShareObsEncoder(nn.Module):
+class ShareObsEncoder1(nn.Module):
     """
     Option1: torch.tensor of shape (num_agents, H, W, C_share) -> (num_agents, state_dim)
     Option2: torch.tensor of shape (n_rollout_threads, num_agents, C_share, H, W) -> (n_rollout_threads, num_agents, state_dim)
     """
+
     def __init__(self, in_channels, state_embedding_dim=128, H=5, W=5):
         super().__init__()
 
@@ -145,6 +152,235 @@ class ShareObsEncoder(nn.Module):
             raise ValueError(
                 f"ShareObsEncoder expected 4D or 5D tensor, got {state.shape}"
             )
+
+
+# Version2 Observer and ShareObserver with batch support
+
+
+class ResBlock(nn.Module):
+    """
+    Simple Residual Block for sparse grid feature extraction.
+    Maintains spatial resolution (stride=1).
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+        # Shortcut to match dimensions if in_channels != out_channels
+        self.shortcut = nn.Identity()
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        x = F.leaky_relu(self.conv1(x), 0.1)
+        x = self.conv2(x)
+        x += residual
+        x = F.leaky_relu(x, 0.1)
+        return x
+
+
+class ObsEncoder(nn.Module):
+    """
+    Option1: torch.tensor of shape (num_agents, H, W, C) -> (num_agents, obs_dim)
+    Option2: torch.tensor of shape (n_rollout_threads, num_agents, C, H, W) -> (n_rollout_threads, num_agents, obs_dim)
+    """
+
+    def __init__(self, in_channels, obs_embedding_dim=128, H=5, W=5):
+        super().__init__()
+        self.H = H
+        self.W = W
+
+        # We add 2 extra channels for x and y coordinates (CoordConv)
+        self.input_dim = in_channels + 2
+
+        # Robust CNN Architecture (CoordConv + ResNet)
+        self.cnn = nn.Sequential(
+            nn.Conv2d(self.input_dim, 32, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            ResBlock(32, 32),
+            ResBlock(32, 64),
+            ResBlock(64, 64),
+            nn.Flatten()
+        )
+
+        # Compute CNN output size dynamically
+        with torch.no_grad():
+            # Dummy now needs to match the input_dim (channels + 2)
+            dummy = torch.zeros(1, self.input_dim, H, W)
+            flatten_dim = self.cnn(dummy).shape[-1]
+
+        self.fc = nn.Sequential(
+            nn.Linear(flatten_dim, 128),
+            nn.LeakyReLU(0.1),
+            nn.Linear(128, obs_embedding_dim),
+            nn.LeakyReLU(0.1)
+        )
+
+        self.apply(_init_layer)
+
+    def _add_coordinate_channels(self, x):
+        """
+        Injects normalized (x, y) coordinates into the input tensor.
+        Input: (Batch, C, H, W) -> Output: (Batch, C+2, H, W)
+        """
+        B, C, H, W = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # Generate grid coordinates
+        x_coords = torch.linspace(-1, 1, steps=W, device=device, dtype=dtype)
+        y_coords = torch.linspace(-1, 1, steps=H, device=device, dtype=dtype)
+
+        # Create meshgrid (H, W)
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+
+        # Expand to (B, 1, H, W)
+        xx = xx.expand(B, 1, H, W)
+        yy = yy.expand(B, 1, H, W)
+
+        # Concatenate along channel dimension
+        return torch.cat([x, xx, yy], dim=1)
+
+    def forward(self, obs):
+        """
+        obs can be:
+            (N, H, W, C)
+            (B, N, H, W, C)
+        """
+        if obs.dim() == 4:
+            # Case 1: (N, H, W, C)
+            x = obs.permute(0, 3, 1, 2)  # -> (N, C, H, W)
+
+            # Inject coordinates before CNN
+            x = self._add_coordinate_channels(x)
+
+            x = self.cnn(x)
+            x = self.fc(x)
+            return x
+
+        elif obs.dim() == 5:
+            # Case 2: (B, N, H, W, C)
+            B, N, H, W, C = obs.shape
+
+            # Merge B and N -> (B*N, H, W, C)
+            x = obs.reshape(B * N, H, W, C)
+
+            # Permute to (B*N, C, H, W)
+            x = x.permute(0, 3, 1, 2)
+
+            # Inject coordinates before CNN
+            x = self._add_coordinate_channels(x)
+
+            # Forward CNN + MLP
+            x = self.cnn(x)
+            x = self.fc(x)
+
+            # Restore batch structure -> (B, N, obs_dim)
+            x = x.reshape(B, N, -1)
+            return x
+
+        else:
+            raise ValueError(f"ObsEncoder expected 4D or 5D tensor, got shape {obs.shape}")
+
+
+class ShareObsEncoder(nn.Module):
+    """
+    Option1: torch.tensor of shape (num_agents, H, W, C_share) -> (num_agents, state_dim)
+    Option2: torch.tensor of shape (n_rollout_threads, num_agents, C_share, H, W) -> (n_rollout_threads, num_agents, state_dim)
+    """
+
+    def __init__(self, in_channels, state_embedding_dim=128, H=5, W=5):
+        super().__init__()
+        self.H = H
+        self.W = W
+
+        # Add 2 channels for CoordConv
+        self.input_dim = in_channels + 2
+
+        # Robust CNN Architecture (CoordConv + ResNet)
+        self.cnn = nn.Sequential(
+            nn.Conv2d(self.input_dim, 32, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            ResBlock(32, 32),
+            ResBlock(32, 64),
+            ResBlock(64, 64),
+            nn.Flatten()
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.input_dim, H, W)
+            flatten_dim = self.cnn(dummy).shape[-1]
+
+        self.fc = nn.Sequential(
+            nn.Linear(flatten_dim, 128),
+            nn.LeakyReLU(0.1),
+            nn.Linear(128, state_embedding_dim),
+            nn.LeakyReLU(0.1)
+        )
+
+        self.apply(_init_layer)
+
+    def _add_coordinate_channels(self, x):
+        """
+        Injects normalized (x, y) coordinates.
+        Input: (Batch, C, H, W) -> Output: (Batch, C+2, H, W)
+        """
+        B, C, H, W = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        x_coords = torch.linspace(-1, 1, steps=W, device=device, dtype=dtype)
+        y_coords = torch.linspace(-1, 1, steps=H, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+
+        xx = xx.expand(B, 1, H, W)
+        yy = yy.expand(B, 1, H, W)
+
+        return torch.cat([x, xx, yy], dim=1)
+
+    def forward(self, state):
+        """
+        state can be:
+            (N, H, W, C_share)
+            (B, N, H, W, C_share)
+        """
+        if state.dim() == 4:
+            # Case 1: (N, H, W, C_share)
+            x = state.permute(0, 3, 1, 2)
+
+            x = self._add_coordinate_channels(x)
+
+            x = self.cnn(x)
+            x = self.fc(x)
+            return x
+
+        elif state.dim() == 5:
+            # Case 2: (B, N, H, W, C_share)
+            B, N, H, W, C = state.shape
+
+            # Merge batch and agent dims: (B*N, H, W, C)
+            x = state.reshape(B * N, H, W, C)
+
+            # Permute to Conv2D format
+            x = x.permute(0, 3, 1, 2)
+
+            # Inject coordinates
+            x = self._add_coordinate_channels(x)
+
+            # CNN + MLP
+            x = self.cnn(x)
+            x = self.fc(x)
+
+            # Restore batch dimension
+            x = x.reshape(B, N, -1)
+            return x
+
+        else:
+            raise ValueError(f"ShareObsEncoder expected 4D or 5D tensor, got {state.shape}")
+
 
 class Actor(nn.Module):
     def __init__(self, obs_dim, role_dim, n_h1, n_h2, n_actions):
@@ -305,6 +541,7 @@ class QLow(nn.Module):
         else:
             raise ValueError(f"Unsupported obs/role shape {obs.shape}")
 
+
 class QHigh(nn.Module):
     def __init__(self, state_dim, n_h1, n_h2, n_actions):
         super().__init__()
@@ -334,7 +571,8 @@ class QHigh(nn.Module):
 
         else:
             raise ValueError(f"Unsupported state shape {state.shape}")
-        
+
+
 class QmixMixer(nn.Module):
     def __init__(self, state_dim, n_agents, n_h_mixer):
         super().__init__()
@@ -389,6 +627,7 @@ class QmixMixer(nn.Module):
 
         y = torch.bmm(hidden, w_final) + b_final   # (BN, 1, 1)
         return y.view(-1, 1)
+
 
 def soft_update(target, source, tau):
     """Soft-update target network parameters."""

@@ -345,7 +345,7 @@ class HMARLModel:
         batch: list of transitions, each:
             [obs_h, share_obs_h, skills, reward_h, obs_next_h, share_obs_next_h, done_env]
 
-        Shapes:
+        Shapes: 
             obs_h:              (B_env, N, H, W, C)
             share_obs_h:        (B_env, N, H, W, C_share)
             skills:             (B_env, N)
@@ -528,7 +528,7 @@ class HMARLModel:
 
         # --- 6. Encode obs ---
         obs_enc = self.obs_encoder(obs_t)           # (B_total, N, obs_dim)
-        obs_next_enc = self.obs_encoder(obs_next_t) # (B_total, N, obs_dim)
+        obs_next_enc = self.obs_encoder(obs_next_t)  # (B_total, N, obs_dim)
 
         # --- 7. One-hot encodings ---
         skills_oh = F.one_hot(skills_t, num_classes=self.num_skills).float()
@@ -696,7 +696,7 @@ class HMARLModel:
         with torch.no_grad():
             _, decoder_probs = self.decoder(traj_down)  # (B, num_skills)
             prob = decoder_probs[torch.arange(B), skills_t]  # (B,)
-        
+
         return prob.cpu().numpy()
         # return np.zeros_like(prob.cpu().numpy()) # return zero
 

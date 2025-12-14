@@ -3,35 +3,34 @@
 # We use separate training scheme here because its training schema is completely different from other algorithms
 
 #!/usr/bin/env python
+from zsceval.utils.train_util import get_base_run_dir, setup_seed
+from zsceval.overcooked_config import get_overcooked_args
+from zsceval.envs.overcooked_new.Overcooked_Env import Overcooked as Overcooked_new
+from zsceval.envs.env_wrappers import ShareDummyVecEnv, ShareSubprocDummyBatchVecEnv
+from zsceval.config import get_config
+from loguru import logger
+import wandb
+import torch
+import setproctitle
+from pathlib import Path
+import sys
+import socket
+import pprint
 import argparse
 import os
-os.chdir("/workspace") # Set working directory to the project root
-import pprint
-import socket
-import sys
-from pathlib import Path
+os.chdir("/workspace")  # Set working directory to the project root
 
-import setproctitle
-import torch
-import wandb
-from loguru import logger
-
-from zsceval.config import get_config
-from zsceval.envs.env_wrappers import ShareDummyVecEnv, ShareSubprocDummyBatchVecEnv
-from zsceval.envs.overcooked_new.Overcooked_Env import Overcooked as Overcooked_new
-from zsceval.overcooked_config import get_overcooked_args
-from zsceval.utils.train_util import get_base_run_dir, setup_seed
 
 os.environ["WANDB_DIR"] = os.getcwd() + "/wandb/"
 os.environ["WANDB_CACHE_DIR"] = os.getcwd() + "/wandb/.cache/"
 os.environ["WANDB_CONFIG_DIR"] = os.getcwd() + "/wandb/.config/"
 
 
-def make_train_env(all_args, run_dir): # 경윤님 수정 예정
+def make_train_env(all_args, run_dir):  # 경윤님 수정 예정
     def get_env_fn(rank):
         def init_env():
-            if all_args.env_name == "Overcooked_new": # currently, we only support overcooked_new for HMARL
-                env = Overcooked_new(all_args, run_dir, rank=rank) # we use overcooked_new env, hmarl policy and trainer has its own interface inside
+            if all_args.env_name == "Overcooked_new":  # currently, we only support overcooked_new for HMARL
+                env = Overcooked_new(all_args, run_dir, rank=rank)  # we use overcooked_new env, hmarl policy and trainer has its own interface inside
             else:
                 print("Can not support the " + all_args.env_name + "environment.")
                 raise NotImplementedError
@@ -52,7 +51,7 @@ def make_train_env(all_args, run_dir): # 경윤님 수정 예정
 def make_eval_env(all_args, run_dir):
     def get_env_fn(rank):
         def init_env():
-            if all_args.env_name == "Overcooked_new": # currently, we only support overcooked_new for HMARL
+            if all_args.env_name == "Overcooked_new":  # currently, we only support overcooked_new for HMARL
                 env = Overcooked_new(all_args, run_dir, rank=rank, evaluation=True)
             else:
                 print("Can not support the " + all_args.env_name + "environment.")
@@ -208,7 +207,7 @@ def main(args):
     else:
         if not all_args.use_wandb and hasattr(runner, "writter"):
             runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
-            runner.writter.close() 
+            runner.writter.close()
 
 
 if __name__ == "__main__":

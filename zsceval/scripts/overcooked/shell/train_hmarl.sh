@@ -1,7 +1,7 @@
 #!/bin/bash
 env="Overcooked_new"
 
-layout="asymmetric_advantages_2p"
+layout="asymmetric_advantages_3p"
 # asymmetric_advantages_2p, asymmetric_advantages_3p, asymmetric_advantages_4p
 # counter_circuit_2p, counter_circuit_3p, counter_circuit_4p
 # forced_coordination_2p, forced_coordination_3p, forced_coordination_4p
@@ -20,32 +20,36 @@ fi
 reward_shaping_horizon="1e8"
 num_env_steps="1e7"
 
-num_agents=2
+num_agents=3 # should match the layout (2 for other default layouts)
 algo="hmarl"
 exp="sp"
 seed_begin=11
 seed_max=15
 ulimit -n 65536
 
-# Heterogeneous Shaped Reward weights (30 components for new version)
+# Heterogeneous Shaped Reward weights (30 components for new version) 
+# Number of w0, w1, w2, ... should match the layout, given as arguments to --w0, --w1, --w2, ...
 # 세 에이전트 모두 같은 weights 사용
 # w0="0,0,0,-1,0.1,0,0,0,0.1,0,-1,0.5,1.0,0.2,0.1,0.2,-2,-1,0.2,0,0.5,50,0,20,-2,-0.01,-0.01,-0.1,-0.1,50"
 # w1="0.1,0,0.2,0,0,0.1,0,0,0,0.2,0,0,0,0,0,0,0,-1,0,0,0,50,0,0,0,-0.01,-0.01,-0.1,-0.1,50"
 # w2="0,0,0,-1,0.1,0,0,0,0.1,0,-1,0.5,1.0,0.2,0.1,0.2,-2,-1,0.2,0,0.5,50,0,20,-2,-0.01,-0.01,-0.1,-0.1,50"
 w0="0,0,0,0,0,0.1,0.1,0,0,0.1,0,3,0,10,-2,3,2,2,-2,-2,5,5,0,20,-5,0,7,20,-5,-0.01,-0.01,-0.1,-0.1,30"
 w1="0,0,0,0,0,0.1,0.1,0,0,0.1,0,3,0,10,-2,3,2,2,-2,-2,5,5,0,20,-5,0,7,20,-5,-0.01,-0.01,-0.1,-0.1,30"
+w2="0,0,0,0,0,0.1,0.1,0,0,0.1,0,3,0,10,-2,3,2,2,-2,-2,5,5,0,20,-5,0,7,20,-5,-0.01,-0.01,-0.1,-0.1,30"
 
 echo "env is ${env}, layout is ${layout}, algo is ${algo}, exp is ${exp}, seed from ${seed_begin} to ${seed_max}"
 echo "Using CUDA device: ${cuda_device}"
+
+# conditions for using use_hsp with more number of agents: --agent_policy_names should match num_agents (if 3, give garbage values ppo ppo ppo etc.), --use_hsp, --w0, --w1, --w2 etc. should match num_agents
 for seed in $(seq ${seed_begin} ${seed_max});
 do
     echo "seed is ${seed}:"
     python ../train/train_hmarl.py --env_name ${env} --algorithm_name ${algo} --experiment_name ${exp} --layout_name ${layout} --num_agents ${num_agents} \
-    --agent_policy_names ppo ppo \
+    --agent_policy_names ppo ppo ppo \
     --seed ${seed} --n_training_threads 1 --n_rollout_threads 40 --dummy_batch_size 2 --num_mini_batch 1 --episode_length 400 --num_env_steps ${num_env_steps} --reward_shaping_horizon ${reward_shaping_horizon} \
     --overcooked_version ${version} \
     --ppo_epoch 15 --entropy_coefs ${entropy_coefs} --entropy_coef_horizons ${entropy_coef_horizons} \
-    --use_hsp --w0 ${w0} --w1 ${w1} --share_policy --random_index \
+    --use_hsp --w0 ${w0} --w1 ${w1} --w2 ${w2} --share_policy --random_index \
     --cnn_layers_params "32,3,1,1 64,3,1,1 32,3,1,1" --use_recurrent_policy \
     --use_proper_time_limits \
     --save_interval 25 --log_interval 10 --use_eval --eval_interval 20 --n_eval_rollout_threads 10 \

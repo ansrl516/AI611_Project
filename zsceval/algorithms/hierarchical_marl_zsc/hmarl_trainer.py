@@ -145,7 +145,7 @@ class HMARLTrainer(OvercookedRunner):
 
         # Snapshot the high-level rewards collected over skill periods within the episode
         if self.episode_high_level_rewards:
-            high_level_reward_mean = float(np.mean(self.episode_high_level_rewards))
+            high_level_reward_mean = float(np.mean(self.episode_high_level_rewards[-5:]))  # FIXME: mean over recent high level rewards
         else:
             high_level_reward_mean = 0.0
 
@@ -280,7 +280,7 @@ class HMARLTrainer(OvercookedRunner):
         # 8) Update cumulative high-level rewards (macro-step reward)
         #     Use scalar env reward per rollout (average over agents).
         # ---------------------------------------------------
-        global_rewards = rewards.mean(axis=1)  # (batch,)
+        global_rewards = rewards.mean(axis=1)  # (batch,) # FIXME: why use mean reward over agents?
         self.rewards_high += global_rewards
 
         # ---------------------------------------------------
@@ -291,14 +291,14 @@ class HMARLTrainer(OvercookedRunner):
 
         if flush_high_level:
             # Cache aggregated reward for logging before it gets reset
-            self.episode_high_level_rewards.append(float(np.mean(self.rewards_high)))
+            self.episode_high_level_rewards.append(float(np.mean(self.rewards_high)))  # FIXME: mean over recent skill rewards
 
             # High-level transition uses env-level reward and done
             self.buf_high.add(
                 [
                     self.obs_h,          # high-level state at skill start
                     self.share_obs_h,    # shared state
-                    self.current_skills, # high-level action (skills)
+                    self.current_skills,  # high-level action (skills)
                     self.rewards_high,   # accumulated reward over this skill period
                     next_obs,            # next high-level state
                     next_share_obs,
@@ -368,7 +368,7 @@ class HMARLTrainer(OvercookedRunner):
             self.epsilon,
         )  # (batch, agents, 1)
 
-        actions = raw_actions.squeeze(-1)  # (batch, agents)
+        actions = raw_actions.squeeze(-1)  # (batch, agents) and include exploration noise
 
         # ---------------------------------------
         # 3) Skill assignment at boundary
@@ -380,30 +380,11 @@ class HMARLTrainer(OvercookedRunner):
             self.obs_h = obs
             self.share_obs_h = share_obs
 
-            # pretrain: assign random skills
-            if self.total_env_steps < self.pretrain_episodes:
-                self.current_skills = np.random.randint(
-                    0, self.N_skills, size=(self.batch_size, self.num_agents)
-                )
-            else:
-                # use the skills predicted internally by HSD
-                self.current_skills = np.copy(self.hsd.current_skills)
+            # use the skills predicted internally by HSD (includes exploration)
+            self.current_skills = np.copy(self.hsd.current_skills)
 
         # ---------------------------------------
-        # 4) Pretraining: override low-level actions with random exploratory actions
-        # ---------------------------------------
-        if self.total_env_steps < self.pretrain_episodes:
-            actions = np.zeros((self.batch_size, self.num_agents), dtype=np.int32)
-            for b in range(self.batch_size):
-                for ag in range(self.num_agents):
-                    avail = available_actions[b, ag]
-                    if np.any(avail):
-                        actions[b, ag] = np.random.choice(np.where(avail == 1)[0])
-                    else:
-                        actions[b, ag] = np.random.randint(self.num_actions)
-
-        # ---------------------------------------
-        # 5) Return action in env-consumable format
+        # 4) Return action in env-consumable format
         # ---------------------------------------
         return self._format_actions_for_env(actions)
 
@@ -462,7 +443,7 @@ class HMARLTrainer_PerAgent(HMARLTrainer):
         super().__init__(cfg_single, device=device)
 
     @torch.no_grad()
-    def get_actions_algorithm(self, steps, obs, share_obs, available_actions): 
+    def get_actions_algorithm(self, steps, obs, share_obs, available_actions):
         obs_exp = np.expand_dims(obs, axis=1)
         share_exp = np.expand_dims(share_obs, axis=1) if share_obs is not None else None
         avail_exp = np.expand_dims(available_actions, axis=1)
