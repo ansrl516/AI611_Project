@@ -10,11 +10,11 @@ config = {
         "buffer_size": 100000,
         "batch_size": 64,
         "pretrain_episodes": 400,
-        "steps_per_train": 4,
+        "steps_per_train": 8,
 
         "epsilon_start": 1.0,
         "epsilon_end": 0.05,
-        "epsilon_div": 20000,
+        "epsilon_div": 5000,
 
         "alpha_start": 0.8,
         "alpha_end": 0.5,
@@ -34,11 +34,11 @@ config = {
 
         "num_agents": 2,
         "num_actions": 6,
-        "num_skills": 1,
+        "num_skills": 4,
         "state_dim": 64,
         "obs_dim": 64,
 
-        "gamma": 0.99,
+        "gamma": 0.9,
         "tau": 0.01,
         "lr_q": 5e-4,
         "lr_decoder": 1e-3,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from collections import deque
 import copy
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -102,6 +103,31 @@ class HMARLTrainer(OvercookedRunner):
         # First training step happens after pretrain_episodes env steps
         self.next_train_step = self.pretrain_episodes
 
+        # RNN support buffers (mirrors rmappo handling)
+        self.use_recurrent_policy = cfg_m.get("use_recurrent_policy", False)
+        self.recurrent_N = cfg_m.get("recurrent_N", 1)
+        self.rnn_hidden_size = cfg_m.get("rnn_hidden_size", cfg_m["obs_dim"])
+        self.masks = np.ones((self.batch_size, self.num_agents, 1), dtype=np.float32)
+
+        if self.use_recurrent_policy:
+            zero_state = lambda: np.zeros(
+                (self.batch_size, self.num_agents, self.recurrent_N, self.rnn_hidden_size),
+                dtype=np.float32,
+            )
+            self.low_rnn_states = zero_state()
+            self.high_rnn_states = zero_state()
+            self.low_rnn_state_prev = zero_state()
+            self.high_rnn_state_prev = zero_state()
+            self.low_mask_buffer = np.copy(self.masks)
+            self.high_mask_buffer = np.copy(self.masks)
+        else:
+            self.low_rnn_states = None
+            self.high_rnn_states = None
+            self.low_rnn_state_prev = None
+            self.high_rnn_state_prev = None
+            self.low_mask_buffer = None
+            self.high_mask_buffer = None
+
     ## --- Core functions that is run only in shared overcooked HMARL runner --- ##
 
     # Update Q_low, Q_high, decoder based on internal buffer and counter using internals
@@ -172,7 +198,16 @@ class HMARLTrainer(OvercookedRunner):
     # Update buffer and accumulated high level rewards based on environment step
     @torch.no_grad()
     def update_buffer(
-        self, steps, obs, share_obs, actions, rewards, next_obs, next_share_obs, dones
+        self,
+        steps,
+        obs,
+        share_obs,
+        actions,
+        rewards,
+        next_obs,
+        next_share_obs,
+        dones,
+        rnn_info: Optional[Dict[str, np.ndarray]] = None,
     ):
         # steps: step within episode
 
@@ -206,16 +241,21 @@ class HMARLTrainer(OvercookedRunner):
         dones = np.asarray(dones)
         # common format: (batch, num_agents, 1) with same value for all agents
         if dones.ndim == 3 and dones.shape[-1] == 1:
-            dones = dones.squeeze(-1)  # (batch, agents)
+            agent_done = dones.squeeze(-1)  # (batch, agents)
         if dones.ndim == 2:
+            if "agent_done" not in locals():
+                agent_done = dones
             # env done if any agent is done
             dones_env = np.any(dones > 0.5, axis=1).astype(np.float32)  # (batch,)
         elif dones.ndim == 1:
             dones_env = (dones > 0.5).astype(np.float32)
+            agent_done = np.repeat(dones_env[:, None], self.num_agents, axis=1)
         else:
             raise ValueError(
                 f"[update_buffer] Unexpected dones shape: {dones.shape}"
             )
+        agent_done = (agent_done > 0.5).astype(np.float32)
+        masks_next = (1.0 - agent_done).reshape(self.batch_size, self.num_agents, 1)
 
         # ---------------------------------------------------
         # 4) Update per-agent sliding window trajectories (for decoder/IR)
@@ -274,7 +314,20 @@ class HMARLTrainer(OvercookedRunner):
         # 7) Insert transition into low-level buffer
         #     done stored as env-level scalar per rollout
         # ---------------------------------------------------
-        self.buf_low.add([obs, actions, rewards_low, self.current_skills, next_obs, dones_env])
+        transition_low = [obs, actions, rewards_low, self.current_skills, next_obs, dones_env]
+        if self.use_recurrent_policy:
+            snapshot = rnn_info or {}
+            low_prev = snapshot.get("low_rnn_state_prev", self.low_rnn_state_prev)
+            low_curr = snapshot.get("low_rnn_states", self.low_rnn_states)
+            low_mask = snapshot.get("low_mask_buffer", self.low_mask_buffer)
+            transition_low.extend(
+                [
+                    None if low_prev is None else np.copy(low_prev),
+                    None if low_curr is None else np.copy(low_curr),
+                    None if low_mask is None else np.copy(low_mask),
+                ]
+            )
+        self.buf_low.add(transition_low)
 
         # ---------------------------------------------------
         # 8) Update cumulative high-level rewards (macro-step reward)
@@ -294,16 +347,32 @@ class HMARLTrainer(OvercookedRunner):
             self.episode_high_level_rewards.append(float(np.mean(self.rewards_high)))  # FIXME: mean over recent skill rewards
 
             # High-level transition uses env-level reward and done
-            self.buf_high.add(
-                [
-                    self.obs_h,          # high-level state at skill start
-                    self.share_obs_h,    # shared state
-                    self.current_skills,  # high-level action (skills)
-                    self.rewards_high,   # accumulated reward over this skill period
-                    next_obs,            # next high-level state
-                    next_share_obs,
-                    dones_env,           # env-level done per rollout
+            if self.use_recurrent_policy:
+                snapshot = rnn_info or {}
+                high_prev = snapshot.get("high_rnn_state_prev", self.high_rnn_state_prev)
+                high_curr = snapshot.get("high_rnn_states", self.high_rnn_states)
+                high_mask = snapshot.get("high_mask_buffer", self.high_mask_buffer)
+                high_context = [
+                    None if high_prev is None else np.copy(high_prev),
+                    None if high_curr is None else np.copy(high_curr),
+                    None if high_mask is None else np.copy(high_mask),
                 ]
+            else:
+                high_context = []
+
+            self.buf_high.add(
+                (
+                    [
+                        self.obs_h,          # high-level state at skill start
+                        self.share_obs_h,    # shared state
+                        self.current_skills,  # high-level action (skills)
+                        self.rewards_high,   # accumulated reward over this skill period
+                        next_obs,            # next high-level state
+                        next_share_obs,
+                        dones_env,           # env-level done per rollout
+                    ]
+                    + high_context
+                )
             )
 
             # Append trajectories to decoder dataset (train_decoder pads if needed)
@@ -329,6 +398,10 @@ class HMARLTrainer(OvercookedRunner):
         # 10) Advance global step counter
         # ---------------------------------------------------
         self.total_env_steps += 1
+        self.masks = masks_next
+        if self.use_recurrent_policy:
+            self._mask_rnn_states(self.low_rnn_states)
+            self._mask_rnn_states(self.high_rnn_states)
 
     # Fetch low level actions during training mode,
     # manages internal buffers, skill assignments, intrinsic rewards, high level rewards ...
@@ -358,15 +431,31 @@ class HMARLTrainer(OvercookedRunner):
             )
 
         # ---------------------------------------
-        # 2) Compute low-level actions from HSD policy
+        # 2) Compute low-level actions from HSD policy (with optional RNN state tracking)
         # ---------------------------------------
-        raw_actions = self.hsd.get_actions_algorithm(
+        if self.use_recurrent_policy:
+            low_prev = np.copy(self.low_rnn_states)
+            high_prev = np.copy(self.high_rnn_states)
+            mask_copy = np.copy(self.masks)
+        else:
+            low_prev = high_prev = mask_copy = None
+
+        raw_actions, low_next, high_next = self.hsd.get_actions_algorithm(
             steps,
             obs,
             share_obs,
             available_actions,
             self.epsilon,
-        )  # (batch, agents, 1)
+            rnn_states_low=low_prev,
+            rnn_states_high=high_prev,
+            masks=self.masks,
+        )  # (batch, agents, 1), plus next hidden states
+
+        if self.use_recurrent_policy:
+            self.low_rnn_state_prev = low_prev
+            if low_next is not None:
+                self.low_rnn_states = low_next
+            self.low_mask_buffer = mask_copy
 
         actions = raw_actions.squeeze(-1)  # (batch, agents) and include exploration noise
 
@@ -382,6 +471,14 @@ class HMARLTrainer(OvercookedRunner):
 
             # use the skills predicted internally by HSD (includes exploration)
             self.current_skills = np.copy(self.hsd.current_skills)
+            if self.use_recurrent_policy:
+                self.high_rnn_state_prev = high_prev
+                self.high_mask_buffer = mask_copy
+                if high_next is not None:
+                    self.high_rnn_states = high_next
+        elif self.use_recurrent_policy and high_next is not None:
+            # Update hidden states even if no boundary (to keep zeros in sync)
+            self.high_rnn_states = high_next
 
         # ---------------------------------------
         # 4) Return action in env-consumable format
@@ -404,6 +501,43 @@ class HMARLTrainer(OvercookedRunner):
         self.episode_high_level_rewards = []
         self.total_env_steps = 0
         self.next_train_step = self.pretrain_episodes
+        self.masks = np.ones((self.batch_size, self.num_agents, 1), dtype=np.float32)
+        if self.use_recurrent_policy:
+            zero_state = lambda: np.zeros(
+                (self.batch_size, self.num_agents, self.recurrent_N, self.rnn_hidden_size),
+                dtype=np.float32,
+            )
+            self.low_rnn_states = zero_state()
+            self.high_rnn_states = zero_state()
+            self.low_rnn_state_prev = zero_state()
+            self.high_rnn_state_prev = zero_state()
+            self.low_mask_buffer = np.copy(self.masks)
+            self.high_mask_buffer = np.copy(self.masks)
+
+    def _mask_rnn_states(self, states: Optional[np.ndarray]) -> None:
+        if states is None:
+            return
+        mask = self.masks
+        while mask.ndim < states.ndim:
+            mask = np.expand_dims(mask, axis=-1)
+        states *= mask
+
+    def get_rnn_snapshot(self) -> Optional[Dict[str, np.ndarray]]:
+        if not self.use_recurrent_policy:
+            return None
+
+        def clone(arr):
+            return None if arr is None else np.copy(arr)
+
+        return {
+            "low_rnn_state_prev": clone(self.low_rnn_state_prev),
+            "low_rnn_states": clone(self.low_rnn_states),
+            "low_mask_buffer": clone(self.low_mask_buffer),
+            "high_rnn_state_prev": clone(self.high_rnn_state_prev),
+            "high_rnn_states": clone(self.high_rnn_states),
+            "high_mask_buffer": clone(self.high_mask_buffer),
+            "masks": clone(self.masks),
+        }
 
     @torch.no_grad()
     def prep_rollout(self):
@@ -452,7 +586,7 @@ class HMARLTrainer_PerAgent(HMARLTrainer):
         return np.squeeze(actions, axis=1)
 
     @torch.no_grad()
-    def update_buffer(self, steps, obs, share_obs, actions, rewards, next_obs, next_share_obs, dones):
+    def update_buffer(self, steps, obs, share_obs, actions, rewards, next_obs, next_share_obs, dones, rnn_info=None):
         actions_arr = np.asarray(actions)
         if actions_arr.ndim == 1:
             actions_arr = actions_arr[:, None]
@@ -486,6 +620,7 @@ class HMARLTrainer_PerAgent(HMARLTrainer):
             np.expand_dims(next_obs, axis=1),
             np.expand_dims(next_share_obs, axis=1) if next_share_obs is not None else None,
             dones_arr,
+            rnn_info=rnn_info,
         )
 
 

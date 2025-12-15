@@ -104,6 +104,11 @@ def main(args):
     assert all_args.algorithm_name == "hmarl", "Only HMARL is supported in train_hmarl.py!"
     all_args.share_policy = True  # HMARL only supports shared policy currently
 
+    if getattr(all_args, "use_recurrent_policy", False) or getattr(all_args, "use_naive_recurrent_policy", False):
+        logger.info(
+            f"Using recurrent HMARL policy: layers={all_args.recurrent_N}, hidden_size={all_args.hidden_size}"
+        )
+
     # cuda
     if all_args.cuda and torch.cuda.is_available():
         cuda_device = getattr(all_args, 'cuda_device', 0)  # Default to 0 if not specified

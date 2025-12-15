@@ -7,6 +7,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 import zsceval.algorithms.hierarchical_marl_zsc.utils.networks as networks
+from zsceval.algorithms.utils.rnn import RNNLayer
 
 
 def hard_update(target, source):
@@ -83,6 +84,31 @@ class HMARLModel:
             "n_h_mixer": cfg_m["n_h_mixer"],
         }
 
+        # Recurrent policy settings (mirrors rmappo-style flags)
+        self.use_recurrent_policy = cfg_m.get("use_recurrent_policy", False)
+        self.recurrent_N = cfg_m.get("recurrent_N", 1)
+        self.rnn_hidden_size = cfg_m.get("rnn_hidden_size", self.obs_dim)
+        self.use_orthogonal = cfg_m.get("use_orthogonal", True)
+        self.low_feature_dim = self.rnn_hidden_size if self.use_recurrent_policy else self.obs_dim
+        self.high_feature_dim = self.rnn_hidden_size if self.use_recurrent_policy else self.obs_dim
+
+        if self.use_recurrent_policy:
+            self.low_rnn = RNNLayer(
+                self.obs_dim,
+                self.rnn_hidden_size,
+                self.recurrent_N,
+                self.use_orthogonal,
+            ).to(self.device)
+            self.high_rnn = RNNLayer(
+                self.obs_dim,
+                self.rnn_hidden_size,
+                self.recurrent_N,
+                self.use_orthogonal,
+            ).to(self.device)
+        else:
+            self.low_rnn = None
+            self.high_rnn = None
+
         # ----------------------------------------------------------------------
         # Build networks
         # ----------------------------------------------------------------------
@@ -112,14 +138,14 @@ class HMARLModel:
 
         # Low-level Q-functions
         self.Q_low = networks.QLow(
-            self.obs_dim,
+            self.low_feature_dim,
             self.num_skills,
             self.nn["n_h1_low"],
             self.nn["n_h2_low"],
             self.num_actions,
         ).to(self.device)
         self.Q_low_target = networks.QLow(
-            self.obs_dim,
+            self.low_feature_dim,
             self.num_skills,
             self.nn["n_h1_low"],
             self.nn["n_h2_low"],
@@ -130,13 +156,13 @@ class HMARLModel:
 
         # High-level Qmix (agent utilities from local obs, mixer from shared obs)
         self.agent_main = networks.QmixSingle(
-            self.obs_dim,
+            self.high_feature_dim,
             self.nn["n_h1_high"],
             self.nn["n_h2_high"],
             self.num_skills,
         ).to(self.device)
         self.agent_target = networks.QmixSingle(
-            self.obs_dim,
+            self.high_feature_dim,
             self.nn["n_h1_high"],
             self.nn["n_h2_high"],
             self.num_skills,
@@ -161,9 +187,9 @@ class HMARLModel:
         self.current_skills = None
         self.step = 0
 
-    ## --- API functions for using it as pretrained policy pool inside separated overcooked runner --- ##
+    ## --- API functions for using it as pretrained policy pool inside separated overcooked runner (UNUSED) --- ##
 
-    @torch.no_grad()
+    @torch.no_grad()  # UNUSED
     def get_actions(
         self,
         share_obs,
@@ -198,7 +224,7 @@ class HMARLModel:
         value = torch.zeros((batch_size, self.num_agents, 1), device=device)
 
         # actions from hierarchical policy
-        action = self.get_actions_algorithm(
+        action, _, _ = self.get_actions_algorithm(
             steps=self.step,
             obs=obs,
             shared_obs=share_obs,
@@ -215,10 +241,10 @@ class HMARLModel:
 
         return value, action, action_log_prob, next_rnn_state, next_rnn_state_critic
 
-    # getting fixed actions for this policy (only used as fixed)
+    # getting fixed actions for this policy (only used as fixed) # UNUSED
     def act(self, obs, rnn_state, mask, available_actions=None, deterministic=True):
         # Dummies: rnn_state, mask, deterministic
-        action = self.get_actions_algorithm(
+        action, _, _ = self.get_actions_algorithm(
             steps=self.step,
             obs=obs,
             shared_obs=obs,
@@ -229,7 +255,7 @@ class HMARLModel:
         self.step += 1
         return action, next_rnn_state
 
-    # dummy function for API compatibility
+    # dummy function for API compatibility # UNUSED
     def lr_decay(self, episode, total):
         pass  # no-op
 
@@ -238,18 +264,102 @@ class HMARLModel:
     ## --- Core action functions for hierarchical MARL with skill discovery --- ##
 
     @torch.no_grad()
-    def get_actions_algorithm(self, steps, obs, shared_obs, available_actions, epsilon=None):
-        """Wraps get_actions_low and assign_skills with internal variables, implements HMARL logic."""
+    def get_actions_algorithm(
+        self,
+        steps,
+        obs,
+        shared_obs,
+        available_actions,
+        epsilon=None,
+        rnn_states_low=None,
+        rnn_states_high=None,
+        masks=None,
+    ):
+        """Wraps get_actions_low and assign_skills with internal variables, implements HMARL logic.\
+        Args:
+            steps:             int, current global step count for each episode
+            obs:               (B, N, H, W, C)
+            shared_obs:        (B, N, H, W, C_share)
+            available_actions: (B, N, A)
+            epsilon:           exploration rate (float or None)
+            rnn_states_low:    (B, N, recurrent_N, hidden) cached hidden states for low-level
+            rnn_states_high:   (B, N, recurrent_N, hidden) cached hidden states for high-level
+            masks:             (B, N, 1) episode masks
+        where B: batch size, N: num agents, A: num actions, C: obs channels, C_share: shared obs channels
+              recurrent_N: number of recurrent layers, hidden: RNN hidden size
+
+        Returns:
+            actions: (B, N, 1) int actions
+            next_low_states: (B, N, recurrent_N, hidden) or None
+            next_high_states: (B, N, recurrent_N, hidden) or None
+
+        """
         # 1. Assign skills at the beginning and every steps_per_assign
         if steps % self.steps_per_assign == 0:
-            self.current_skills = self.assign_skills(obs=obs, share_obs=shared_obs, epsilon=epsilon)  # [B, N]
+            skills, next_high_states = self.assign_skills(
+                obs=obs,
+                share_obs=shared_obs,
+                epsilon=epsilon,
+                rnn_states=rnn_states_high,
+                masks=masks,
+            )
+            self.current_skills = skills
+        else:
+            next_high_states = None
 
         # 2. Get low-level actions using current skills
-        actions = self.get_actions_low(obs, available_actions, self.current_skills, epsilon=epsilon)  # [B, N]
+        actions, next_low_states = self.get_actions_low(
+            obs,
+            available_actions,
+            self.current_skills,
+            epsilon=epsilon,
+            rnn_states=rnn_states_low,
+            masks=masks,
+        )  # [B, N]
 
-        return self._format_actions(actions)  # [B, N, 1]
+        return self._format_actions(actions), next_low_states, next_high_states  # [B, N, 1], [B, N, rnn_N, hidden], [B, N, rnn_N, hidden]
 
-    def get_actions_low(self, obs, available_actions, skills, epsilon=None):
+    def _apply_rnn(self, rnn_layer, inputs, rnn_states, masks):
+        """Shared helper to run GRU layers in (batch, agent, feat) format."""
+        if not self.use_recurrent_policy or rnn_layer is None:
+            return inputs, rnn_states
+
+        B, N, F = inputs.shape
+        flat_inputs = inputs.reshape(B * N, F)
+
+        hidden_size = rnn_layer.rnn.hidden_size
+        if rnn_states is None:
+            hxs = torch.zeros(
+                B * N,
+                self.recurrent_N,
+                hidden_size,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            hxs = torch.as_tensor(rnn_states, dtype=torch.float32, device=self.device)
+            hxs = hxs.reshape(B * N, self.recurrent_N, hidden_size)
+
+        if masks is None:  # meaning of masks: 1 for non-terminal, 0 for terminal (in overcooked, there is no terminals, so mask is always 1)
+            masks_flat = torch.ones(
+                B * N, 1, dtype=torch.float32, device=self.device
+            )
+        else:
+            masks_flat = torch.as_tensor(masks, dtype=torch.float32, device=self.device)
+            masks_flat = masks_flat.reshape(B * N, 1)
+
+        out_flat, next_states = rnn_layer(flat_inputs, hxs, masks_flat)
+        out = out_flat.reshape(B, N, hidden_size)
+        next_states = next_states.reshape(B, N, self.recurrent_N, hidden_size)
+        return out, next_states
+
+    def _apply_low_rnn(self, obs_encoded, rnn_states, masks):
+        return self._apply_rnn(self.low_rnn, obs_encoded, rnn_states, masks)
+
+    def _apply_high_rnn(self, obs_encoded, rnn_states, masks):
+        return self._apply_rnn(self.high_rnn, obs_encoded, rnn_states, masks)
+
+    def get_actions_low(self, obs, available_actions, skills, epsilon=None, rnn_states=None, masks=None):
         """
         Compute low-level control actions conditioned on current skills.
 
@@ -258,9 +368,12 @@ class HMARLModel:
             available_actions: (B, N, A)
             skills:            (B, N) int skill indices
             epsilon:           optional exploration rate for low-level (float)
+            rnn_states:        (B, N, recurrent_N, hidden) cached hidden states
+            masks:             (B, N, 1) episode masks
 
         Returns:
             actions: (B, N) int actions
+            next_rnn_states: (B, N, recurrent_N, hidden) or None
         """
 
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)          # (B, N, H, W, C)
@@ -269,8 +382,11 @@ class HMARLModel:
             available_actions, dtype=torch.bool, device=self.device
         )  # (B, N, A)
 
-        # encode observations
+        # encode observations (if using RNN, encoder list of obs using CNN first, and then apply RNN with previous hidden states)
         obs_encoded = self.obs_encoder(obs_t)  # (B, N, obs_dim)
+        next_low_states = None
+        if self.use_recurrent_policy:
+            obs_encoded, next_low_states = self._apply_low_rnn(obs_encoded, rnn_states, masks)
 
         # one-hot skills
         skills_onehot = F.one_hot(skills_t, num_classes=self.num_skills).float()  # (B, N, K)
@@ -301,17 +417,26 @@ class HMARLModel:
                     else:
                         actions_np[b, n] = np.random.randint(self.num_actions)
 
-        return actions_np
+        next_low_states_np = (
+            next_low_states.detach().cpu().numpy()
+            if next_low_states is not None
+            else None
+        )
 
-    def assign_skills(self, obs, share_obs=None, epsilon=None):
+        return actions_np, next_low_states_np
+
+    def assign_skills(self, obs, share_obs=None, epsilon=None, rnn_states=None, masks=None):
         """
         Assign skills to agents via high-level Q-network.
         Args:
             obs: np array of shape [B, N, H, W, C]
             share_obs: optional np array of shape [B, N, H, W, C_share]
             epsilon: exploration rate (float or None)
+            rnn_states: cached hidden states for high-level controller
+            masks: episode masks (B, N, 1)
         Returns:
             skills: np array of shape [B, N]
+            next_rnn_states: np array of shape [B, N, recurrent_N, hidden] or None
         """
 
         B = obs.shape[0]
@@ -324,6 +449,9 @@ class HMARLModel:
 
         # Per-agent utilities use local observation encoding (matches training).
         obs_encoded = self.obs_encoder(obs_t)  # (B, N, obs_dim)
+        next_high_states = None
+        if self.use_recurrent_policy:
+            obs_encoded, next_high_states = self._apply_high_rnn(obs_encoded, rnn_states, masks)
 
         with torch.no_grad():
             q_values = self.agent_main(obs_encoded)  # (B, N, K)
@@ -334,7 +462,13 @@ class HMARLModel:
         random_skills = np.random.randint(0, self.num_skills, size=(B, N))
         skills = np.where(explore_mask, random_skills, greedy_skills)
 
-        return skills.astype(np.int32)
+        next_high_states_np = (
+            next_high_states.detach().cpu().numpy()
+            if next_high_states is not None
+            else None
+        )
+
+        return skills.astype(np.int32), next_high_states_np
 
     ## --- End of Core action functions --- ##
 
@@ -353,10 +487,27 @@ class HMARLModel:
             obs_next_h:         (B_env, N, H, W, C)
             share_obs_next_h:   (B_env, N, H, W, C_share)
             done_env:           (B_env,)
+
+
         """
 
         # Unzip
-        obs_list, share_list, skills_list, reward_list, obsn_list, sharen_list, done_list = zip(*batch)
+        if self.use_recurrent_policy:
+            (
+                obs_list,
+                share_list,
+                skills_list,
+                reward_list,
+                obsn_list,
+                sharen_list,
+                done_list,
+                rnn_state_list,
+                rnn_state_next_list,
+                mask_list,
+            ) = zip(*batch)
+        else:
+            obs_list, share_list, skills_list, reward_list, obsn_list, sharen_list, done_list = zip(*batch)
+            rnn_state_list = rnn_state_next_list = mask_list = None
 
         # Stack
         obs = np.stack(obs_list, axis=0)            # (B_s, B_env, N, H, W, C)
@@ -388,11 +539,41 @@ class HMARLModel:
         share_obs_next_t = torch.as_tensor(share_obs_next, dtype=torch.float32, device=self.device)
         dones_t = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
 
+        # RNN states & masks if using recurrent policy
+        if self.use_recurrent_policy:
+            rnn_states_t = torch.as_tensor(
+                np.stack(rnn_state_list, axis=0).reshape(
+                    B_total, N, self.recurrent_N, self.rnn_hidden_size
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            rnn_states_next_t = torch.as_tensor(
+                np.stack(rnn_state_next_list, axis=0).reshape(
+                    B_total, N, self.recurrent_N, self.rnn_hidden_size
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            masks_t = torch.as_tensor(
+                np.stack(mask_list, axis=0).reshape(B_total, N, 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            rnn_states_t = rnn_states_next_t = masks_t = None
+
         # Encode
         obs_enc = self.obs_encoder(obs_t)                      # (B_total, N, obs_dim)
         share_enc = self.share_obs_encoder(share_obs_t)        # (B_total, N, state_dim)
         obs_next_enc = self.obs_encoder(obs_next_t)
         share_next_enc = self.share_obs_encoder(share_obs_next_t)
+
+        # Apply RNNs to obs_enc if using recurrent policy (starting from hidden state which was stored at -1 step, we add current input to get current hidden state(output))
+        if self.use_recurrent_policy:
+            obs_enc, _ = self._apply_high_rnn(obs_enc, rnn_states_t, masks_t)
+            mask_next = (1.0 - dones_t.view(B_total, 1)).expand(-1, self.num_agents).unsqueeze(-1)
+            obs_next_enc, _ = self._apply_high_rnn(obs_next_enc, rnn_states_next_t, mask_next)
 
         # QMIX mixer expects a single state vector per sample (not per-agent),
         # so collapse the agent dimension of the shared encodings.
@@ -411,6 +592,9 @@ class HMARLModel:
             state_next_enc,
             obs_next_enc,
             dones_t,
+            rnn_states_t,
+            rnn_states_next_t,
+            masks_t,
         )
 
     def train_policy_high(self, batch):
@@ -424,6 +608,9 @@ class HMARLModel:
             state_next,
             obs_next,
             done,
+            rnn_states,
+            rnn_states_next,
+            masks,
         ) = self.process_batch_high(batch)
 
         # one-step TD for joint Q_tot
@@ -488,7 +675,21 @@ class HMARLModel:
         """
 
         # --- 1. Unzip transitions ---
-        obs_list, act_list, rew_list, skill_list, next_obs_list, done_list = zip(*batch)
+        if self.use_recurrent_policy:
+            (
+                obs_list,
+                act_list,
+                rew_list,
+                skill_list,
+                next_obs_list,
+                done_list,
+                rnn_state_list,
+                rnn_state_next_list,
+                mask_list,
+            ) = zip(*batch)
+        else:
+            obs_list, act_list, rew_list, skill_list, next_obs_list, done_list = zip(*batch)
+            rnn_state_list = rnn_state_next_list = mask_list = None
 
         # --- 2. Stack each field ---
         obs = np.stack(obs_list, axis=0)            # (B_s, B_env, N, H, W, C)
@@ -526,9 +727,40 @@ class HMARLModel:
         skills_t = torch.as_tensor(skills, dtype=torch.int64, device=self.device)
         dones_t = torch.as_tensor(dones_flat, dtype=torch.float32, device=self.device)
 
+        # RNN states & masks if using recurrent policy
+        if self.use_recurrent_policy:
+            rnn_states_t = torch.as_tensor(
+                np.stack(rnn_state_list, axis=0).reshape(
+                    B_total, N, self.recurrent_N, self.rnn_hidden_size
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            rnn_states_next_t = torch.as_tensor(
+                np.stack(rnn_state_next_list, axis=0).reshape(
+                    B_total, N, self.recurrent_N, self.rnn_hidden_size
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            masks_t = torch.as_tensor(
+                np.stack(mask_list, axis=0).reshape(B_total, N, 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            rnn_states_t = rnn_states_next_t = masks_t = None
+
         # --- 6. Encode obs ---
         obs_enc = self.obs_encoder(obs_t)           # (B_total, N, obs_dim)
         obs_next_enc = self.obs_encoder(obs_next_t)  # (B_total, N, obs_dim)
+
+        # Apply RNNs to obs_enc if using recurrent policy (starting from hidden state which was stored at -1 step, we add current input to get current hidden state(output))
+        if self.use_recurrent_policy:
+            done_agent = dones_t.view(B_total, 1).expand(-1, self.num_agents)
+            obs_enc, _ = self._apply_low_rnn(obs_enc, rnn_states_t, masks_t)
+            mask_next = (1.0 - done_agent).unsqueeze(-1)
+            obs_next_enc, _ = self._apply_low_rnn(obs_next_enc, rnn_states_next_t, mask_next)
 
         # --- 7. One-hot encodings ---
         skills_oh = F.one_hot(skills_t, num_classes=self.num_skills).float()
@@ -542,6 +774,9 @@ class HMARLModel:
             obs_next_enc,
             skills_oh,
             dones_t,
+            rnn_states_t,
+            rnn_states_next_t,
+            masks_t,
         )
 
     def train_policy_low(self, batch):
@@ -554,9 +789,13 @@ class HMARLModel:
             obs_next,
             skills,
             done,
+            rnn_states,
+            rnn_states_next,
+            masks,
         ) = self.process_batch_low(batch)
 
         B = obs.shape[0]
+        done_agent = done.view(B, 1).expand(-1, self.num_agents)
 
         # one-step TD for low-level Q
         with torch.no_grad():
@@ -570,8 +809,7 @@ class HMARLModel:
             ).squeeze(2)  # (B, N)
 
             # done is per-env; expand to per-agent
-            done_expanded = done.view(B, 1)  # (B, 1)
-            done_expanded = done_expanded.expand_as(q_target_selected)  # (B, N)
+            done_expanded = done_agent  # (B, N)
             done_mult = 1.0 - done_expanded
 
             target = rewards + self.gamma * q_target_selected * done_mult  # (B, N)
@@ -726,6 +964,14 @@ class HMARLModel:
                 "mixer_target": self.mixer_target.state_dict(),
                 "obs_encoder": self.obs_encoder.state_dict(),
                 "share_obs_encoder": self.share_obs_encoder.state_dict(),
+                **(
+                    {
+                        "low_rnn": self.low_rnn.state_dict(),
+                        "high_rnn": self.high_rnn.state_dict(),
+                    }
+                    if self.use_recurrent_policy
+                    else {}
+                ),
             },
             path,
         )
@@ -741,6 +987,11 @@ class HMARLModel:
         self.mixer_target.load_state_dict(checkpoint["mixer_target"])
         self.obs_encoder.load_state_dict(checkpoint["obs_encoder"])
         self.share_obs_encoder.load_state_dict(checkpoint["share_obs_encoder"])
+        if self.use_recurrent_policy:
+            if "low_rnn" in checkpoint:
+                self.low_rnn.load_state_dict(checkpoint["low_rnn"])
+            if "high_rnn" in checkpoint:
+                self.high_rnn.load_state_dict(checkpoint["high_rnn"])
 
     def prep_rollout(self):
         self.decoder.eval()
@@ -749,6 +1000,9 @@ class HMARLModel:
         self.mixer_main.eval()
         self.obs_encoder.eval()
         self.share_obs_encoder.eval()
+        if self.use_recurrent_policy:
+            self.low_rnn.eval()
+            self.high_rnn.eval()
 
         # reset internal skill storage
         self.reset()
@@ -760,3 +1014,6 @@ class HMARLModel:
         self.mixer_main.train()
         self.obs_encoder.train()
         self.share_obs_encoder.train()
+        if self.use_recurrent_policy:
+            self.low_rnn.train()
+            self.high_rnn.train()

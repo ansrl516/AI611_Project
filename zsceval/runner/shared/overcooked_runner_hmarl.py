@@ -122,6 +122,13 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         model_cfg["act_space"] = self.envs.action_space
         # Whether we use obs instead of state (for centralized critic)
         model_cfg["use_obs_instead_of_state"] = self.use_obs_instead_of_state
+        model_cfg["use_recurrent_policy"] = bool(
+            getattr(self.all_args, "use_recurrent_policy", False)
+            or getattr(self.all_args, "use_naive_recurrent_policy", False)
+        )
+        model_cfg["recurrent_N"] = getattr(self.all_args, "recurrent_N", 1)
+        model_cfg["rnn_hidden_size"] = getattr(self.all_args, "hidden_size", model_cfg["obs_dim"])
+        model_cfg["use_orthogonal"] = getattr(self.all_args, "use_orthogonal", True)
 
         # These come from env action space (not PKL)
         model_cfg["num_actions"] = self.envs.action_space[0].n
@@ -177,7 +184,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             for step in range(self.episode_length):
                 # Sample actions based on recent environment interaction
                 # Trainer internally hides actual details, only prints out low level action
-                actions = self.collect(step, obs, share_obs, available_actions)  # [n_rollout_threads, num_agents,] where each entry is action 0 ~ 5
+                actions, rnn_info = self.collect(step, obs, share_obs, available_actions)  # [n_rollout_threads, num_agents,]
                 # Interact with the environment to get observations, rewards, and next observations
                 (
                     _obs_batch_single_agent,
@@ -194,7 +201,15 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 self.envs.anneal_reward_shaping_factor([total_num_steps] * self.n_rollout_threads)
 
                 data = (
-                    step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones
+                    step,
+                    obs,
+                    share_obs,
+                    actions,
+                    rewards,
+                    obs_next,
+                    share_obs_next,
+                    dones,
+                    rnn_info,
                 )
                 self.insert(data)
 
@@ -363,11 +378,12 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         # trainer internally includes policy, and updates buffers, current skills, intrinsic rewards, ... internally
         # so it only prints out actions, actual training algorithm of hmarl is hidden
         actions = self.trainer.get_actions_algorithm(step, obs, share_obs, available_actions)
+        rnn_info = self.trainer.get_rnn_snapshot()
 
-        return actions
+        return actions, rnn_info
 
     def insert(self, data):  # override to fit HMARLTrainer
-        step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones = data
+        step, obs, share_obs, actions, rewards, obs_next, share_obs_next, dones, rnn_info = data
 
         self.trainer.update_buffer(
             step,
@@ -378,6 +394,7 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             obs_next,
             share_obs_next,
             dones,
+            rnn_info=rnn_info,
         )
 
     def restore(self):
@@ -451,16 +468,33 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         episode_rewards = np.zeros((self.n_eval_rollout_threads, self.num_agents))
 
         self.trainer.prep_rollout()  # set eval mode
+        if self.trainer.use_recurrent_policy:
+            eval_low_states = np.zeros(
+                (self.n_eval_rollout_threads, self.num_agents, self.trainer.recurrent_N, self.trainer.rnn_hidden_size),
+                dtype=np.float32,
+            )
+            eval_high_states = np.zeros_like(eval_low_states)
+        else:
+            eval_low_states = eval_high_states = None
+        eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
 
         for step in range(self.episode_length):
             # HMARLModel deterministic act
-            actions = self.trainer.hsd.get_actions_algorithm(
+            actions, next_low_states, next_high_states = self.trainer.hsd.get_actions_algorithm(
                 step,
                 obs,
                 share_obs,
                 available_actions,
-                epsilon=0.0  # no exploration in eval
+                epsilon=0.0,  # no exploration in eval
+                rnn_states_low=eval_low_states,
+                rnn_states_high=eval_high_states,
+                masks=eval_masks,
             )
+            if self.trainer.use_recurrent_policy:
+                if next_low_states is not None:
+                    eval_low_states = next_low_states
+                if next_high_states is not None:
+                    eval_high_states = next_high_states
             # actions = self.inverse_transform(actions, self.n_eval_rollout_threads)
             # print("eval actions shape:", actions.shape)
             # Step the environment
@@ -480,6 +514,19 @@ class OvercookedRunnerHMARL(OvercookedRunner):
             episode_rewards += rewards.squeeze(-1)
 
             obs, share_obs, available_actions = obs_next, share_obs_next, available_actions_next
+            dones_arr = np.asarray(dones)
+            if dones_arr.ndim == 3 and dones_arr.shape[-1] == 1:
+                agent_done = dones_arr.squeeze(-1)
+            elif dones_arr.ndim == 2:
+                agent_done = dones_arr
+            elif dones_arr.ndim == 1:
+                agent_done = np.repeat(dones_arr[:, None], self.num_agents, axis=1)
+            else:
+                raise ValueError(f"Unexpected dones shape during eval: {dones_arr.shape}")
+            eval_masks = (1.0 - (agent_done > 0.5).astype(np.float32))[..., None]
+            if self.trainer.use_recurrent_policy:
+                self._mask_rnn_states(eval_low_states, eval_masks)
+                self._mask_rnn_states(eval_high_states, eval_masks)
 
         # --- Logging ---
         for eval_info in infos:
@@ -502,20 +549,36 @@ class OvercookedRunnerHMARL(OvercookedRunner):
         obs = np.array([info['all_agent_obs'] for info in info_list])
         share_obs = np.array([info['share_obs'] for info in info_list])
         available_actions = np.array([info['available_actions'] for info in info_list])
-
         for episode in tqdm(range(self.all_args.render_episodes)):
             episode_rewards = np.zeros((self.n_render_rollout_threads, self.num_agents))
+            if self.trainer.use_recurrent_policy:
+                render_low_states = np.zeros(
+                    (self.n_render_rollout_threads, self.num_agents, self.trainer.recurrent_N, self.trainer.rnn_hidden_size),
+                    dtype=np.float32,
+                )
+                render_high_states = np.zeros_like(render_low_states)
+            else:
+                render_low_states = render_high_states = None
+            render_masks = np.ones((self.n_render_rollout_threads, self.num_agents, 1), dtype=np.float32)
 
             for step in range(self.episode_length):
                 self.trainer.prep_rollout()
 
-                actions = self.trainer.hsd.get_actions_algorithm(
+                actions, next_low_states, next_high_states = self.trainer.hsd.get_actions_algorithm(
                     step,
                     obs,
                     share_obs,
                     available_actions,
                     epsilon=0.0,
+                    rnn_states_low=render_low_states,
+                    rnn_states_high=render_high_states,
+                    masks=render_masks,
                 )
+                if self.trainer.use_recurrent_policy:
+                    if next_low_states is not None:
+                        render_low_states = next_low_states
+                    if next_high_states is not None:
+                        render_high_states = next_high_states
                 print("render actions shape:", actions.shape)
                 (
                     _obs_single_agent,
@@ -531,9 +594,31 @@ class OvercookedRunnerHMARL(OvercookedRunner):
                 episode_rewards += rewards
 
                 obs, share_obs, available_actions = obs_next, share_obs_next, available_actions_next
+                dones_arr = np.asarray(dones)
+                if dones_arr.ndim == 3 and dones_arr.shape[-1] == 1:
+                    agent_done = dones_arr.squeeze(-1)
+                elif dones_arr.ndim == 2:
+                    agent_done = dones_arr
+                elif dones_arr.ndim == 1:
+                    agent_done = np.repeat(dones_arr[:, None], self.num_agents, axis=1)
+                else:
+                    raise ValueError(f"Unexpected dones shape during render: {dones_arr.shape}")
+                render_masks = (1.0 - (agent_done > 0.5).astype(np.float32))[..., None]
+                if self.trainer.use_recurrent_policy:
+                    self._mask_rnn_states(render_low_states, render_masks)
+                    self._mask_rnn_states(render_high_states, render_masks)
 
-            logger.info("render average episode rewards: "
+        logger.info("render average episode rewards: "
                         f"{np.mean(np.sum(episode_rewards, axis=1)):.3f}")
+
+    @staticmethod
+    def _mask_rnn_states(states, masks):
+        if states is None or masks is None:
+            return
+        mask = masks
+        while mask.ndim < states.ndim:
+            mask = np.expand_dims(mask, axis=-1)
+        states *= mask
 
     def log_train(self, train_infos, total_num_steps):
         for k, v in train_infos.items():

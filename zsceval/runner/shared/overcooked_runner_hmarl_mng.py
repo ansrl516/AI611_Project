@@ -341,7 +341,7 @@ class OvercookedRunnerHMARL_mng(OvercookedRunner):
         self.trainer.prep_rollout()
 
         for step in range(self.episode_length):
-            actions = self.trainer.hsd.get_actions_algorithm(
+            actions, _, _ = self.trainer.hsd.get_actions_algorithm(
                 step,
                 obs,
                 share_obs,
@@ -387,7 +387,7 @@ class OvercookedRunnerHMARL_mng(OvercookedRunner):
             for step in range(self.episode_length):
                 self.trainer.prep_rollout()
 
-                actions = self.trainer.hsd.get_actions_algorithm(
+                actions, _, _ = self.trainer.hsd.get_actions_algorithm(
                     step,
                     obs,
                     share_obs,

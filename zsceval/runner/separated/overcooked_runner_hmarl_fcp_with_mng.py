@@ -603,7 +603,7 @@ class OvercookedRunnerMNG(OvercookedRunner):
         for step in range(self.episode_length):
             actions_by_agent = []
             for agent_id, trainer in enumerate(self.trainer):
-                agent_actions = trainer.hsd.get_actions_algorithm(
+                agent_actions, _, _ = trainer.hsd.get_actions_algorithm(
                     step,
                     obs,
                     share_obs,
@@ -667,7 +667,7 @@ class OvercookedRunnerMNG(OvercookedRunner):
 
                 actions_by_agent = []
                 for agent_id, trainer in enumerate(self.trainer):
-                    agent_actions = trainer.hsd.get_actions_algorithm(
+                    agent_actions, _, _ = trainer.hsd.get_actions_algorithm(
                         step,
                         obs,
                         share_obs,
